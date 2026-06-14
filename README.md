@@ -15,6 +15,27 @@ process on the same origin, and every request the browser makes is **relative**,
 so the app works behind a reverse proxy — including under a subpath — with no
 URL configuration.
 
+## Screenshots
+
+The dashboard lists every responder with its overall status and a coloured pill
+per verification test (green = pass, red = fail, grey = skipped):
+
+![Dashboard](screenshots/dashboard.png)
+
+Each responder's history records status changes over time:
+
+![History](screenshots/history.png)
+
+Settings holds the global default test selection (foundational vs. evaluation
+groups) and the default response-time threshold:
+
+![Settings](screenshots/settings.png)
+
+Adding or editing a responder lets you pin its own test selection (or inherit
+the global default) and set a per-responder response-time threshold:
+
+![Edit responder](screenshots/edit-responder.png)
+
 ## Why single-container
 
 - **One upstream for your reverse proxy.** No CORS, no cross-service routing, no

@@ -57,6 +57,45 @@ The first check runs immediately; subsequent checks run on the schedule. Use
 | `HISTORY_LIMIT` | `200` | Status-history rows retained per responder. |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR`. |
 | `DATA_DIR` | `/data` | Where the SQLite DB is stored (mount a volume here). |
+| `TRUSTED_PROXY_HOPS` | `1` | Proxy hops to trust for `X-Forwarded-*`. Set `0` to disable `ProxyFix` when exposed directly. |
+| `OCSP_BLOCK_PRIVATE` | `true` | Block RFC 1918 / unique-local destinations for OCSP and Kuma fetches. |
+| `OCSP_ALLOWED_HOSTS` | *(empty)* | Comma-separated hostnames / IPs / CIDRs that bypass the private-range block. |
+| `MAX_PEM_BYTES` | `32768` | Maximum accepted size per PEM field. |
+| `MAX_RESPONDERS` | `100` | Maximum responders (0 = unlimited). |
+| `RATE_LIMIT_MUTATE` | `60` | Per-IP create/update/delete/settings requests per minute (0 = off). |
+| `RATE_LIMIT_CHECK` | `20` | Per-IP on-demand check requests per minute (0 = off). |
+
+## Security
+
+This app has **no built-in authentication** — run it behind a reverse proxy
+that handles auth, and on a trusted network. The hardening below reduces the
+blast radius but does not replace access control.
+
+- **SSRF egress controls.** The OCSP URI, the URL from a certificate's AIA
+  extension, and the Uptime Kuma push URL are all validated before any
+  server-side fetch: only `http`/`https` is allowed, redirects are disabled,
+  and loopback / link-local (incl. the `169.254.169.254` cloud-metadata
+  address) / multicast / reserved destinations are always blocked. Private
+  (RFC 1918 / ULA) ranges are blocked too unless you set
+  `OCSP_BLOCK_PRIVATE=false` — internal-PKI users monitoring private responders
+  should instead allowlist them via `OCSP_ALLOWED_HOSTS` (hostnames, IPs, or
+  CIDRs). Note: DNS-rebinding is only partially mitigated; prefer the allowlist
+  for sensitive networks.
+- **CSRF.** State-changing API requests require an `X-Requested-With` header and
+  a JSON content type, which browsers can't send cross-origin without a CORS
+  preflight the app never grants. Set `SameSite` on any session cookie you add.
+- **Secrets.** The Uptime Kuma push URL embeds a token. It is stored in SQLite
+  and **never returned by the API** (only a mask is shown) nor logged. Treat the
+  data volume as secret-bearing and protect it. Editing a responder leaves the
+  push-URL field blank to keep the existing value; type a new URL to replace it.
+- **Error messages.** Network/parse errors are returned to clients as generic,
+  category-level messages (full detail is logged server-side) so they can't be
+  used as an SSRF reconnaissance oracle.
+- **Abuse limits.** Per-IP rate limits on mutating and on-demand-check
+  endpoints, a cap on PEM size, and a cap on responder count.
+- **Direct exposure.** `docker-compose.yml` binds to `127.0.0.1`. If you expose
+  the container directly, set `TRUSTED_PROXY_HOPS=0` so clients can't spoof
+  `X-Forwarded-*` headers.
 
 ## Reverse proxy
 
@@ -216,7 +255,13 @@ Responder objects carry a `tests` field: `null` means "inherit the global
 default set", and an array of test keys (e.g. `["cert_status","signature"]`)
 pins that responder's own selection. A `response_time_ms` field (or `null` to
 inherit the global default) sets the limit for the response-time test. The most
-recent per-test outcomes are returned in `last_checks`.
+recent per-test outcomes are returned in `last_checks`. The `uptime_kuma_url`
+field is returned **masked** (the secret token is never exposed); a boolean
+`uptime_kuma_url_set` indicates whether one is configured. On update, send a new
+URL to replace it or omit/blank it to keep the stored value.
+
+State-changing requests (`POST`/`PUT`/`DELETE`) must include an
+`X-Requested-With` header and a JSON body, and are rate-limited per client IP.
 
 ## Data & backup
 

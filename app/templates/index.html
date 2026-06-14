@@ -215,6 +215,17 @@ const API = (p) => {
   const base = window.location.pathname.replace(/\/+$/, "");
   return base + "/api" + p;
 };
+// State-changing calls send X-Requested-With so the server can reject forged
+// cross-site requests (a cross-origin page can't set this header without a
+// CORS preflight, which the API does not grant).
+function mutate(url, method, body) {
+  const opts = { method, headers: { "X-Requested-With": "XMLHttpRequest" } };
+  if (body !== undefined) {
+    opts.headers["Content-Type"] = "application/json";
+    opts.body = JSON.stringify(body);
+  }
+  return fetch(url, opts);
+}
 let editingId = null;
 let AVAILABLE_TESTS = [];          // [{key,label}] from /api/tests
 let globalDefaultTests = [];       // current global default set
@@ -319,6 +330,7 @@ function openForm() {
   editingId = null;
   document.getElementById('formTitle').textContent = 'Add responder';
   ['f_alias','f_cert','f_issuer','f_uri','f_kuma','f_resptime'].forEach(i => document.getElementById(i).value = '');
+  document.getElementById('f_kuma').placeholder = 'https://status.example.com/api/push/TOKEN';
   document.getElementById('f_freq').value = 60;
   document.getElementById('f_enabled').checked = true;
   document.getElementById('f_tests_inherit').checked = true;
@@ -338,7 +350,13 @@ async function editRow(id) {
   document.getElementById('f_cert').value = r.cert_pem || '';
   document.getElementById('f_issuer').value = r.issuer_pem || '';
   document.getElementById('f_uri').value = r.ocsp_uri || '';
-  document.getElementById('f_kuma').value = r.uptime_kuma_url || '';
+  // The push URL is a secret and is never returned; the field stays blank.
+  // Leaving it blank keeps the stored value; typing a new one replaces it.
+  const kuma = document.getElementById('f_kuma');
+  kuma.value = '';
+  kuma.placeholder = r.uptime_kuma_url_set
+    ? 'A push URL is set — leave blank to keep it, or enter a new one'
+    : 'https://status.example.com/api/push/TOKEN';
   document.getElementById('f_freq').value = r.frequency_min;
   document.getElementById('f_enabled').checked = r.enabled;
   document.getElementById('f_resptime').value = (r.response_time_ms == null ? '' : r.response_time_ms);
@@ -371,7 +389,7 @@ async function saveForm() {
   try {
     const url = editingId ? API('/responders/' + editingId) : API('/responders');
     const method = editingId ? 'PUT' : 'POST';
-    const res = await fetch(url, { method, headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+    const res = await mutate(url, method, payload);
     if (!res.ok) {
       const err = await res.json();
       document.getElementById('formErrors').textContent =
@@ -386,15 +404,16 @@ async function saveForm() {
 
 async function delRow(id, alias) {
   if (!confirm('Delete "' + alias + '"?')) return;
-  await fetch(API('/responders/' + id), { method: 'DELETE' });
-  flash('Deleted.'); load();
+  const res = await mutate(API('/responders/' + id), 'DELETE');
+  flash(res.ok ? 'Deleted.' : 'Delete failed.'); load();
 }
 
 async function checkNow(id) {
   flash('Checking…');
   try {
-    await fetch(API('/responders/' + id + '/check'), { method: 'POST' });
-    flash('Check complete.'); load();
+    const res = await mutate(API('/responders/' + id + '/check'), 'POST');
+    flash(res.ok ? 'Check complete.' : (res.status === 429 ? 'Rate limited — slow down.' : 'Check failed.'));
+    load();
   } catch (e) { flash('Check failed: ' + e.message); }
 }
 
@@ -427,15 +446,12 @@ async function openSettings() {
 }
 function closeSettings() { document.getElementById('settingsOverlay').classList.remove('open'); }
 async function saveSettings() {
-  await fetch(API('/settings'), {
-    method: 'PUT', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({
-      debug_logging: document.getElementById('s_debug').checked,
-      log_only_failures: document.getElementById('s_failures').checked,
-      uptime_kuma_logging: document.getElementById('s_kuma').checked,
-      default_tests: selectedTests('s_tests_box'),
-      default_response_time_ms: parseInt(document.getElementById('s_resptime').value) || 2000,
-    })
+  await mutate(API('/settings'), 'PUT', {
+    debug_logging: document.getElementById('s_debug').checked,
+    log_only_failures: document.getElementById('s_failures').checked,
+    uptime_kuma_logging: document.getElementById('s_kuma').checked,
+    default_tests: selectedTests('s_tests_box'),
+    default_response_time_ms: parseInt(document.getElementById('s_resptime').value) || 2000,
   });
   globalDefaultTests = selectedTests('s_tests_box');
   closeSettings(); flash('Settings saved.');

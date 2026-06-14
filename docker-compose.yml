@@ -6,8 +6,12 @@ services:
     container_name: ocsp-monitor
     restart: unless-stopped
     ports:
-      # Host:Container. Point your reverse proxy upstream at this host port.
-      - "8080:8080"
+      # Bind to loopback only: the app has no authentication, so expose it
+      # through your reverse proxy rather than directly. Point the proxy
+      # upstream at 127.0.0.1:8080. To serve it directly (no proxy), change
+      # this to "8080:8080" AND set TRUSTED_PROXY_HOPS=0 so forwarded headers
+      # can't be spoofed.
+      - "127.0.0.1:8080:8080"
     environment:
       PORT: "8080"
       # Set to a subpath (e.g. "/ocsp") if your reverse proxy serves the app
@@ -20,6 +24,18 @@ services:
       # Rows of status history kept per responder.
       HISTORY_LIMIT: "${HISTORY_LIMIT:-200}"
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      # Reverse-proxy hops to trust for X-Forwarded-* (0 disables ProxyFix).
+      TRUSTED_PROXY_HOPS: "${TRUSTED_PROXY_HOPS:-1}"
+      # SSRF egress controls. Block private (RFC1918/ULA) destinations; loopback
+      # and link-local (incl. cloud metadata) are always blocked. Internal-PKI
+      # users can set OCSP_BLOCK_PRIVATE=false and/or allowlist specific hosts.
+      OCSP_BLOCK_PRIVATE: "${OCSP_BLOCK_PRIVATE:-true}"
+      OCSP_ALLOWED_HOSTS: "${OCSP_ALLOWED_HOSTS:-}"
+      # Abuse limits.
+      MAX_PEM_BYTES: "${MAX_PEM_BYTES:-32768}"
+      MAX_RESPONDERS: "${MAX_RESPONDERS:-100}"
+      RATE_LIMIT_MUTATE: "${RATE_LIMIT_MUTATE:-60}"
+      RATE_LIMIT_CHECK: "${RATE_LIMIT_CHECK:-20}"
     volumes:
       # Persistent SQLite database (survives container rebuilds).
       - ocsp_data:/data

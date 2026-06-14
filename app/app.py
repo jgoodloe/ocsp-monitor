@@ -14,12 +14,15 @@ out to the openssl binary).
 import os
 import json
 import base64
+import socket
+import ipaddress
 import sqlite3
 import threading
 import time
 import logging
 from contextlib import closing
 from datetime import datetime, timezone, timedelta
+from urllib.parse import urlsplit
 
 import requests
 from flask import (
@@ -51,6 +54,37 @@ OCSP_TIMEOUT = int(os.environ.get("OCSP_TIMEOUT", "30"))
 # Number of history rows retained per responder.
 HISTORY_LIMIT = int(os.environ.get("HISTORY_LIMIT", "200"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+
+
+def _env_bool(name, default):
+    return os.environ.get(name, str(default)).strip().lower() in ("1", "true", "yes", "on")
+
+
+# --- SSRF egress controls --------------------------------------------------- #
+# Block RFC 1918 / unique-local (private) destinations. Loopback, link-local
+# (incl. 169.254 cloud-metadata), multicast, reserved and unspecified addresses
+# are ALWAYS blocked regardless of this flag. Internal-PKI deployments that
+# legitimately monitor responders on private IPs can set this false (and/or use
+# OCSP_ALLOWED_HOSTS to permit specific hosts/CIDRs).
+OCSP_BLOCK_PRIVATE = _env_bool("OCSP_BLOCK_PRIVATE", True)
+# Comma-separated hostnames, IPs, or CIDRs that bypass the private-range block.
+OCSP_ALLOWED_HOSTS = [
+    h.strip() for h in os.environ.get("OCSP_ALLOWED_HOSTS", "").split(",") if h.strip()
+]
+
+# --- Reverse-proxy trust ---------------------------------------------------- #
+# Number of proxy hops to trust for X-Forwarded-* headers. 0 disables ProxyFix
+# entirely (correct when the app is exposed directly, not behind a proxy).
+TRUSTED_PROXY_HOPS = int(os.environ.get("TRUSTED_PROXY_HOPS", "1"))
+
+# --- Abuse / resource limits ------------------------------------------------ #
+# Max accepted size (bytes) for each PEM field.
+MAX_PEM_BYTES = int(os.environ.get("MAX_PEM_BYTES", "32768"))
+# Max number of responders that may exist (0 = unlimited).
+MAX_RESPONDERS = int(os.environ.get("MAX_RESPONDERS", "100"))
+# Token-bucket rate limits per client IP (requests per minute; 0 = unlimited).
+RATE_LIMIT_MUTATE = int(os.environ.get("RATE_LIMIT_MUTATE", "60"))
+RATE_LIMIT_CHECK = int(os.environ.get("RATE_LIMIT_CHECK", "20"))
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -238,6 +272,67 @@ def now_iso():
 def get_setting(db, key, default="false"):
     row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
     return row["value"] if row else default
+
+
+# --------------------------------------------------------------------------- #
+# Outbound URL safety (SSRF egress controls)
+# --------------------------------------------------------------------------- #
+class UnsafeURLError(ValueError):
+    """Raised when an outbound URL is rejected by the egress policy."""
+
+
+def _host_in_allowlist(hostname, ip):
+    """True if the hostname or resolved IP matches an OCSP_ALLOWED_HOSTS entry."""
+    for entry in OCSP_ALLOWED_HOSTS:
+        if hostname and hostname.lower() == entry.lower():
+            return True
+        try:
+            if ip in ipaddress.ip_network(entry, strict=False):
+                return True
+        except ValueError:
+            pass  # entry was a hostname, not a CIDR/IP
+    return False
+
+
+def validate_outbound_url(url):
+    """Validate a URL we are about to fetch server-side.
+
+    Enforces an http/https scheme and rejects addresses that should never be
+    reached from the server: loopback, link-local (incl. 169.254 cloud
+    metadata), multicast, reserved and unspecified are always blocked; private
+    / unique-local are blocked when OCSP_BLOCK_PRIVATE is set, unless the host
+    is explicitly allowlisted. Returns the parsed host. Raises UnsafeURLError.
+    """
+    if not url or not url.strip():
+        raise UnsafeURLError("empty URL")
+    parts = urlsplit(url.strip())
+    if parts.scheme.lower() not in ("http", "https"):
+        raise UnsafeURLError("scheme must be http or https")
+    hostname = parts.hostname
+    if not hostname:
+        raise UnsafeURLError("missing host")
+
+    # Resolve every address the host maps to and check each one.
+    try:
+        infos = socket.getaddrinfo(hostname, parts.port or 0, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as e:
+        raise UnsafeURLError(f"hostname does not resolve: {e}")
+
+    seen = set()
+    for info in infos:
+        addr = info[4][0].split("%")[0]  # strip any IPv6 zone id
+        if addr in seen:
+            continue
+        seen.add(addr)
+        ip = ipaddress.ip_address(addr)
+        allowed = _host_in_allowlist(hostname, ip)
+        if ip.is_loopback or ip.is_link_local or ip.is_multicast \
+                or ip.is_reserved or ip.is_unspecified:
+            if not allowed:
+                raise UnsafeURLError(f"destination {addr} is not permitted")
+        elif ip.is_private and OCSP_BLOCK_PRIVATE and not allowed:
+            raise UnsafeURLError(f"destination {addr} is in a private range")
+    return hostname
 
 
 # --------------------------------------------------------------------------- #
@@ -574,17 +669,27 @@ def run_ocsp_check(cert_pem, issuer_pem, ocsp_uri, enabled_tests=None,
         cert = _load_cert(cert_pem, "Certificate")
         issuer = _load_cert(issuer_pem, "Issuer certificate")
     except Exception as e:
-        record("cert_load", False, f"Certificate load failed: {e}")
+        log.info("[OCSP] certificate load failed: %s", e)
+        record("cert_load", False, "Certificate or issuer PEM could not be parsed.")
         return finish()
     record("cert_load", True, "Certificate and issuer loaded.")
 
-    # 2. Resolve the OCSP URI (given, or from the cert's AIA extension).
+    # 2. Resolve the OCSP URI (given, or from the cert's AIA extension) and
+    #    validate it against the egress policy before we ever fetch it. The
+    #    AIA-derived URI is attacker-controlled too, so it is checked the same.
     uri = (ocsp_uri or "").strip() or _ocsp_uri_from_cert(cert)
     if not uri:
         record("ocsp_uri", False,
                "No OCSP URI provided and none found in the certificate's AIA extension.")
         return finish()
-    record("ocsp_uri", True, "OCSP URI resolved.")
+    try:
+        validate_outbound_url(uri)
+    except UnsafeURLError as e:
+        log.warning("[OCSP] blocked outbound URI %r: %s", uri, e)
+        record("ocsp_uri", False,
+               "OCSP URI is not permitted by the server's egress policy.")
+        return finish()
+    record("ocsp_uri", True, "OCSP URI resolved and permitted.")
 
     # 3. Build the request (attaching a nonce only when that test is selected).
     sent_nonce = None
@@ -596,20 +701,26 @@ def run_ocsp_check(cert_pem, issuer_pem, ocsp_uri, enabled_tests=None,
         ocsp_req = builder.build()
         der = ocsp_req.public_bytes(serialization.Encoding.DER)
     except Exception as e:
-        record("request_build", False, f"Failed to build OCSP request: {e}")
+        log.info("[OCSP] request build failed: %s", e)
+        record("request_build", False, "Could not build the OCSP request.")
         return finish()
     record("request_build", True, "OCSP request built.")
 
-    # 4. POST to the responder.
+    # 4. POST to the responder. Redirects are disabled so a responder can't
+    #    bounce us to an internal address that bypassed validation.
     try:
         resp = requests.post(
             uri, data=der,
             headers={"Content-Type": "application/ocsp-request",
                      "Accept": "application/ocsp-response"},
             timeout=timeout,
+            allow_redirects=False,
         )
     except requests.exceptions.RequestException as e:
-        record("reachable", False, f"OCSP responder unreachable: {e}")
+        # Generic client-facing message: the detailed exception (connection
+        # refused vs. timeout vs. DNS) is an SSRF reconnaissance oracle.
+        log.warning("[OCSP] responder request failed for %r: %s", uri, e)
+        record("reachable", False, "OCSP responder is unreachable.")
         return finish()
     record("reachable", True, "Responder reachable.")
 
@@ -617,7 +728,7 @@ def run_ocsp_check(cert_pem, issuer_pem, ocsp_uri, enabled_tests=None,
 
     # 5. HTTP 200.
     if resp.status_code != 200:
-        record("http_200", False, f"OCSP responder returned HTTP {resp.status_code}.")
+        record("http_200", False, "OCSP responder did not return HTTP 200.")
         return finish(response_ms=elapsed_ms)
     record("http_200", True, "Responder returned HTTP 200.")
 
@@ -625,7 +736,8 @@ def run_ocsp_check(cert_pem, issuer_pem, ocsp_uri, enabled_tests=None,
     try:
         ocsp_resp = load_der_ocsp_response(resp.content)
     except Exception as e:
-        record("response_parse", False, f"Failed to parse OCSP response: {e}")
+        log.info("[OCSP] response parse failed: %s", e)
+        record("response_parse", False, "OCSP response could not be parsed.")
         return finish(response_ms=elapsed_ms)
     record("response_parse", True, "Response parsed as DER.")
 
@@ -665,6 +777,13 @@ def run_ocsp_check(cert_pem, issuer_pem, ocsp_uri, enabled_tests=None,
 def push_to_uptime_kuma(url, status, message, logging_enabled=True):
     if not url or not url.strip():
         return
+    # The push URL carries a secret token and is attacker-influenceable, so it
+    # is subject to the same egress policy and is never logged in full.
+    try:
+        validate_outbound_url(url)
+    except UnsafeURLError as e:
+        log.warning("[UptimeKuma] push URL blocked by egress policy: %s", e)
+        return
     kuma_status = "up" if status == "Valid" else "down"
     try:
         if logging_enabled:
@@ -673,9 +792,11 @@ def push_to_uptime_kuma(url, status, message, logging_enabled=True):
             url,
             params={"status": kuma_status, "msg": message, "ping": ""},
             timeout=5,
+            allow_redirects=False,
         )
     except requests.exceptions.RequestException as e:
-        log.warning("[UptimeKuma] push failed: %s", e)
+        # Don't log `e` — it can contain the full URL (token).
+        log.warning("[UptimeKuma] push failed (network error).")
 
 
 # --------------------------------------------------------------------------- #
@@ -809,8 +930,68 @@ def start_scheduler():
 # Flask app
 # --------------------------------------------------------------------------- #
 app = Flask(__name__)
-# Trust X-Forwarded-* from one proxy hop.
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+# Trust X-Forwarded-* only for the configured number of proxy hops. Setting
+# TRUSTED_PROXY_HOPS=0 disables ProxyFix, which is the correct choice when the
+# app is exposed directly (otherwise clients can spoof X-Forwarded-* to forge
+# source IPs and influence generated URLs). Match the count to your topology.
+if TRUSTED_PROXY_HOPS > 0:
+    app.wsgi_app = ProxyFix(
+        app.wsgi_app, x_for=TRUSTED_PROXY_HOPS, x_proto=TRUSTED_PROXY_HOPS,
+        x_host=TRUSTED_PROXY_HOPS, x_prefix=TRUSTED_PROXY_HOPS,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Lightweight per-IP token-bucket rate limiting (single-process, in-memory)
+# --------------------------------------------------------------------------- #
+_rl_lock = threading.Lock()
+_rl_buckets = {}  # (ip, name) -> [tokens, last_refill_monotonic]
+
+
+def _rate_ok(name, capacity):
+    """Token bucket: `capacity` requests per 60s per client IP. 0 = unlimited."""
+    if capacity <= 0:
+        return True
+    ip = request.remote_addr or "unknown"
+    now = time.monotonic()
+    rate = capacity / 60.0
+    with _rl_lock:
+        tokens, last = _rl_buckets.get((ip, name), (capacity, now))
+        tokens = min(capacity, tokens + (now - last) * rate)
+        if tokens < 1:
+            _rl_buckets[(ip, name)] = (tokens, now)
+            return False
+        _rl_buckets[(ip, name)] = (tokens - 1, now)
+        return True
+
+
+@app.before_request
+def _guard_requests():
+    """CSRF + rate-limit guard for state-changing API requests.
+
+    Cross-site form posts can't set a custom header without triggering a CORS
+    preflight (which we don't answer), so requiring X-Requested-With blocks
+    forged requests from other origins. We also require a JSON content type for
+    requests with a body and apply per-IP rate limits.
+    """
+    if request.method not in ("POST", "PUT", "DELETE", "PATCH"):
+        return None
+    if not request.path.startswith("/api/"):
+        return None
+
+    if not request.headers.get("X-Requested-With"):
+        return jsonify({"message": "Missing X-Requested-With header."}), 403
+
+    if request.method in ("POST", "PUT", "PATCH") and request.get_data():
+        ctype = (request.content_type or "").split(";")[0].strip().lower()
+        if ctype != "application/json":
+            return jsonify({"message": "Content-Type must be application/json."}), 415
+
+    limit = RATE_LIMIT_CHECK if request.path.endswith("/check") else RATE_LIMIT_MUTATE
+    bucket = "check" if request.path.endswith("/check") else "mutate"
+    if not _rate_ok(bucket, limit):
+        return jsonify({"message": "Rate limit exceeded. Slow down."}), 429
+    return None
 
 
 @app.teardown_appcontext
@@ -818,6 +999,19 @@ def close_db(exc):
     db = getattr(g, "_db", None)
     if db is not None:
         db.close()
+
+
+def _mask_secret_url(url):
+    """Mask the token-bearing path/query of a push URL, keeping scheme+host."""
+    if not url:
+        return ""
+    try:
+        p = urlsplit(url)
+        if p.scheme and p.netloc:
+            return f"{p.scheme}://{p.netloc}/…/••••"
+    except ValueError:
+        pass
+    return "••••"
 
 
 def _load_checks(value):
@@ -838,7 +1032,11 @@ def responder_to_dict(row, include_pem=True):
         "ocsp_uri": row["ocsp_uri"],
         "frequency_min": row["frequency_min"],
         "enabled": bool(row["enabled"]),
-        "uptime_kuma_url": row["uptime_kuma_url"],
+        # The push URL embeds a secret token, so never return it verbatim.
+        # The UI shows the mask and re-saves only when the operator types a new
+        # value (a blank field keeps the stored URL — see update_responder).
+        "uptime_kuma_url": _mask_secret_url(row["uptime_kuma_url"]),
+        "uptime_kuma_url_set": bool((row["uptime_kuma_url"] or "").strip()),
         # None means "inherit the global default set".
         "tests": parse_tests(row["tests"] if "tests" in row.keys() else None),
         # None means "inherit the global default threshold".
@@ -874,7 +1072,8 @@ def api_status():
         get_db().execute("SELECT 1")
         return jsonify({"status": "ok", "database": "connected"})
     except Exception as e:
-        return jsonify({"status": "error", "database": str(e)}), 500
+        log.error("[Health] database check failed: %s", e)
+        return jsonify({"status": "error", "database": "unavailable"}), 500
 
 
 # ---- Responders CRUD ---- #
@@ -921,22 +1120,28 @@ def _validate_payload(data, partial=False):
     if not partial or "cert_alias" in data:
         if not (data.get("cert_alias") or "").strip():
             errors.append("cert_alias is required.")
-    if not partial or "cert_pem" in data:
-        if "BEGIN CERTIFICATE" not in (data.get("cert_pem") or ""):
-            errors.append("cert_pem must be a PEM certificate.")
-    if not partial or "issuer_pem" in data:
-        if "BEGIN CERTIFICATE" not in (data.get("issuer_pem") or ""):
-            errors.append("issuer_pem must be a PEM certificate.")
+    for field in ("cert_pem", "issuer_pem"):
+        if partial and field not in data:
+            continue
+        value = data.get(field) or ""
+        if "BEGIN CERTIFICATE" not in value:
+            errors.append(f"{field} must be a PEM certificate.")
+        elif len(value.encode("utf-8")) > MAX_PEM_BYTES:
+            errors.append(f"{field} exceeds the maximum size of {MAX_PEM_BYTES} bytes.")
     return errors
 
 
 @app.route("/api/responders", methods=["POST"])
 def create_responder():
-    data = request.get_json(force=True, silent=True) or {}
+    data = request.get_json(silent=True) or {}
     errors = _validate_payload(data)
     if errors:
         return jsonify({"message": "Validation failed", "errors": errors}), 400
     db = get_db()
+    if MAX_RESPONDERS > 0:
+        count = db.execute("SELECT COUNT(*) AS n FROM responders").fetchone()["n"]
+        if count >= MAX_RESPONDERS:
+            return jsonify({"message": f"Responder limit ({MAX_RESPONDERS}) reached."}), 409
     now = now_iso()
     cur = db.execute(
         """INSERT INTO responders
@@ -968,7 +1173,7 @@ def create_responder():
 
 @app.route("/api/responders/<int:rid>", methods=["PUT"])
 def update_responder(rid):
-    data = request.get_json(force=True, silent=True) or {}
+    data = request.get_json(silent=True) or {}
     errors = _validate_payload(data, partial=True)
     if errors:
         return jsonify({"message": "Validation failed", "errors": errors}), 400
@@ -984,7 +1189,13 @@ def update_responder(rid):
         "ocsp_uri": (data.get("ocsp_uri", row["ocsp_uri"]) or "").strip(),
         "frequency_min": int(data.get("frequency_min", row["frequency_min"])),
         "enabled": 1 if data.get("enabled", bool(row["enabled"])) else 0,
-        "uptime_kuma_url": (data.get("uptime_kuma_url", row["uptime_kuma_url"]) or "").strip(),
+        # Keep the stored push URL unless a new, non-blank value is supplied
+        # (the API only ever returns a mask, so a blank field means "unchanged").
+        "uptime_kuma_url": (
+            data["uptime_kuma_url"].strip()
+            if "uptime_kuma_url" in data and (data.get("uptime_kuma_url") or "").strip()
+            else row["uptime_kuma_url"]
+        ),
         # Only touch the test selection if the client sent it.
         "tests": _tests_to_db(data["tests"]) if "tests" in data else row["tests"],
         "response_time_ms": (_int_or_none(data["response_time_ms"])
@@ -1071,11 +1282,16 @@ def get_settings():
 
 @app.route("/api/settings", methods=["PUT"])
 def put_settings():
-    data = request.get_json(force=True, silent=True) or {}
+    data = request.get_json(silent=True) or {}
     db = get_db()
+    # Only known settings keys may be written (no arbitrary key injection).
     for k, v in data.items():
+        if k not in DEFAULT_SETTINGS:
+            continue
         if k == "default_tests":
             sv = ",".join(parse_tests(v) or [])
+        elif k == "default_response_time_ms":
+            sv = str(_int_or_none(v) or DEFAULT_RESPONSE_TIME_MS)
         elif v is True:
             sv = "true"
         elif v is False:

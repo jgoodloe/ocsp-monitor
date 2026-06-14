@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OCSP Monitor</title>
+<style>
+  :root {
+    --bg: #0f172a; --panel: #1e293b; --panel2: #273449; --border: #334155;
+    --text: #e2e8f0; --muted: #94a3b8; --accent: #38bdf8; --accent2: #0ea5e9;
+    --good: #22c55e; --bad: #ef4444; --warn: #f59e0b; --unknown: #64748b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+    font-size: 14px;
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 24px; background: var(--panel); border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 10;
+  }
+  header h1 { font-size: 18px; margin: 0; display: flex; align-items: center; gap: 10px; }
+  header h1 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); }
+  .toolbar { display: flex; gap: 8px; align-items: center; }
+  main { padding: 24px; max-width: 1200px; margin: 0 auto; }
+  button {
+    background: var(--accent2); color: #00121f; border: 0; border-radius: 6px;
+    padding: 8px 14px; font-weight: 600; cursor: pointer; font-size: 13px;
+  }
+  button:hover { background: var(--accent); }
+  button.secondary { background: var(--panel2); color: var(--text); border: 1px solid var(--border); }
+  button.secondary:hover { background: var(--border); }
+  button.danger { background: #7f1d1d; color: #fee2e2; }
+  button.danger:hover { background: #991b1b; }
+  button.tiny { padding: 4px 9px; font-size: 12px; }
+  table { width: 100%; border-collapse: collapse; background: var(--panel); border-radius: 8px; overflow: hidden; }
+  th, td { text-align: left; padding: 11px 12px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
+  tr:last-child td { border-bottom: 0; }
+  tr:hover td { background: var(--panel2); }
+  .badge {
+    display: inline-block; padding: 3px 10px; border-radius: 999px;
+    font-weight: 700; font-size: 12px;
+  }
+  .badge.Valid { background: rgba(34,197,94,.15); color: var(--good); }
+  .badge.Revoked { background: rgba(239,68,68,.15); color: var(--bad); }
+  .badge.Error { background: rgba(245,158,11,.15); color: var(--warn); }
+  .badge.Unknown { background: rgba(100,116,139,.2); color: var(--muted); }
+  .muted { color: var(--muted); }
+  .msg { font-size: 12px; min-height: 16px; }
+  .actions { display: flex; gap: 6px; }
+  .empty { text-align: center; padding: 48px; color: var(--muted); }
+  /* Modal */
+  .overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,.6); display: none;
+    align-items: flex-start; justify-content: center; padding: 40px 16px; z-index: 100; overflow:auto;
+  }
+  .overlay.open { display: flex; }
+  .modal {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    width: 100%; max-width: 640px; padding: 24px;
+  }
+  .modal h2 { margin: 0 0 16px; font-size: 16px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 12px 0 4px; font-weight: 600; }
+  input[type=text], input[type=number], input[type=url], textarea {
+    width: 100%; background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    color: var(--text); padding: 9px 10px; font-size: 13px; font-family: inherit;
+  }
+  textarea { resize: vertical; min-height: 90px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
+  .row { display: flex; gap: 14px; }
+  .row > div { flex: 1; }
+  .check { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
+  .check input { width: auto; }
+  .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
+  .errors { color: var(--bad); font-size: 12px; margin-top: 8px; white-space: pre-line; }
+  .hist-row { display:flex; justify-content:space-between; gap:12px; padding:8px 0; border-bottom:1px solid var(--border); }
+  .hist-row:last-child { border-bottom:0; }
+  .small { font-size: 12px; }
+  .settings-row { display:flex; align-items:center; gap:10px; padding:8px 0; }
+  .settings-row input { width:auto; }
+  code { background: var(--bg); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1><span class="dot"></span> OCSP Monitor</h1>
+  <div class="toolbar">
+    <span class="msg muted" id="globalMsg"></span>
+    <button class="secondary" onclick="openSettings()">Settings</button>
+    <button onclick="openForm()">+ Add responder</button>
+  </div>
+</header>
+
+<main>
+  <table id="table">
+    <thead>
+      <tr>
+        <th>Alias</th><th>Status</th><th>Message</th><th>Resp</th>
+        <th>Next update</th><th>Last run</th><th>Freq</th><th></th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div class="empty" id="empty" style="display:none">No responders configured yet. Click <b>+ Add responder</b> to begin.</div>
+</main>
+
+<!-- Add/Edit modal -->
+<div class="overlay" id="formOverlay">
+  <div class="modal">
+    <h2 id="formTitle">Add responder</h2>
+    <label>Alias *</label>
+    <input type="text" id="f_alias" placeholder="e.g. DHS PIV signing cert">
+    <label>Certificate to check (PEM) *</label>
+    <textarea id="f_cert" placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"></textarea>
+    <label>Issuer certificate (PEM) *</label>
+    <textarea id="f_issuer" placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"></textarea>
+    <label>OCSP URI <span class="muted">(optional — falls back to the cert's AIA extension)</span></label>
+    <input type="url" id="f_uri" placeholder="http://ocsp.example.gov">
+    <div class="row">
+      <div>
+        <label>Check frequency (minutes)</label>
+        <input type="number" id="f_freq" value="60" min="1">
+      </div>
+      <div>
+        <label>Uptime Kuma push URL (optional)</label>
+        <input type="url" id="f_kuma" placeholder="https://status.example.com/api/push/TOKEN">
+      </div>
+    </div>
+    <div class="check">
+      <input type="checkbox" id="f_enabled" checked>
+      <label for="f_enabled" style="margin:0">Enabled</label>
+    </div>
+    <div class="errors" id="formErrors"></div>
+    <div class="modal-actions">
+      <button class="secondary" onclick="closeForm()">Cancel</button>
+      <button onclick="saveForm()" id="saveBtn">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- History modal -->
+<div class="overlay" id="histOverlay">
+  <div class="modal">
+    <h2 id="histTitle">History</h2>
+    <div id="histBody" class="small"></div>
+    <div class="modal-actions">
+      <button class="secondary" onclick="closeHist()">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- Settings modal -->
+<div class="overlay" id="settingsOverlay">
+  <div class="modal">
+    <h2>Settings</h2>
+    <div class="settings-row">
+      <input type="checkbox" id="s_debug"><label for="s_debug" style="margin:0">Debug logging</label>
+    </div>
+    <div class="settings-row">
+      <input type="checkbox" id="s_failures"><label for="s_failures" style="margin:0">Log only failures</label>
+    </div>
+    <div class="settings-row">
+      <input type="checkbox" id="s_kuma"><label for="s_kuma" style="margin:0">Log Uptime Kuma pushes</label>
+    </div>
+    <div class="modal-actions">
+      <button class="secondary" onclick="closeSettings()">Cancel</button>
+      <button onclick="saveSettings()">Save</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// All API calls are RELATIVE to the current page — this is what makes the app
+// work behind a reverse proxy at any subpath without configuration.
+const API = (p) => {
+  const base = window.location.pathname.replace(/\/+$/, "");
+  return base + "/api" + p;
+};
+let editingId = null;
+
+function fmt(dt) {
+  if (!dt) return '—';
+  const d = new Date(dt);
+  return isNaN(d) ? dt : d.toLocaleString();
+}
+function flash(msg) {
+  const el = document.getElementById('globalMsg');
+  el.textContent = msg;
+  if (msg) setTimeout(() => { if (el.textContent === msg) el.textContent = ''; }, 4000);
+}
+
+async function load() {
+  try {
+    const res = await fetch(API('/responders'));
+    const data = await res.json();
+    const rows = document.getElementById('rows');
+    document.getElementById('empty').style.display = data.length ? 'none' : 'block';
+    document.getElementById('table').style.display = data.length ? 'table' : 'none';
+    rows.innerHTML = '';
+    for (const r of data) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td><b>${esc(r.cert_alias)}</b>${r.enabled ? '' : ' <span class="muted small">(disabled)</span>'}</td>
+        <td><span class="badge ${r.status}">${r.status}</span></td>
+        <td class="muted small">${esc(r.last_message || '')}</td>
+        <td class="small">${r.response_ms != null ? r.response_ms + ' ms' : '—'}</td>
+        <td class="small">${fmt(r.next_update)}</td>
+        <td class="small">${fmt(r.last_run)}</td>
+        <td class="small">${r.frequency_min}m</td>
+        <td><div class="actions">
+          <button class="secondary tiny" onclick="checkNow(${r.id})">Check</button>
+          <button class="secondary tiny" onclick="showHist(${r.id}, '${esc(r.cert_alias)}')">History</button>
+          <button class="secondary tiny" onclick="editRow(${r.id})">Edit</button>
+          <button class="danger tiny" onclick="delRow(${r.id}, '${esc(r.cert_alias)}')">Del</button>
+        </div></td>`;
+      rows.appendChild(tr);
+    }
+  } catch (e) { flash('Failed to load: ' + e.message); }
+}
+function esc(s) { return (s||'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+function openForm() {
+  editingId = null;
+  document.getElementById('formTitle').textContent = 'Add responder';
+  ['f_alias','f_cert','f_issuer','f_uri','f_kuma'].forEach(i => document.getElementById(i).value = '');
+  document.getElementById('f_freq').value = 60;
+  document.getElementById('f_enabled').checked = true;
+  document.getElementById('formErrors').textContent = '';
+  document.getElementById('formOverlay').classList.add('open');
+}
+function closeForm() { document.getElementById('formOverlay').classList.remove('open'); }
+
+async function editRow(id) {
+  const res = await fetch(API('/responders/' + id));
+  const r = await res.json();
+  editingId = id;
+  document.getElementById('formTitle').textContent = 'Edit responder';
+  document.getElementById('f_alias').value = r.cert_alias;
+  document.getElementById('f_cert').value = r.cert_pem || '';
+  document.getElementById('f_issuer').value = r.issuer_pem || '';
+  document.getElementById('f_uri').value = r.ocsp_uri || '';
+  document.getElementById('f_kuma').value = r.uptime_kuma_url || '';
+  document.getElementById('f_freq').value = r.frequency_min;
+  document.getElementById('f_enabled').checked = r.enabled;
+  document.getElementById('formErrors').textContent = '';
+  document.getElementById('formOverlay').classList.add('open');
+}
+
+async function saveForm() {
+  const payload = {
+    cert_alias: document.getElementById('f_alias').value,
+    cert_pem: document.getElementById('f_cert').value,
+    issuer_pem: document.getElementById('f_issuer').value,
+    ocsp_uri: document.getElementById('f_uri').value,
+    uptime_kuma_url: document.getElementById('f_kuma').value,
+    frequency_min: parseInt(document.getElementById('f_freq').value) || 60,
+    enabled: document.getElementById('f_enabled').checked,
+  };
+  const btn = document.getElementById('saveBtn');
+  btn.disabled = true;
+  try {
+    const url = editingId ? API('/responders/' + editingId) : API('/responders');
+    const method = editingId ? 'PUT' : 'POST';
+    const res = await fetch(url, { method, headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+    if (!res.ok) {
+      const err = await res.json();
+      document.getElementById('formErrors').textContent =
+        (err.errors || [err.message || 'Save failed']).join('\n');
+      return;
+    }
+    closeForm(); flash('Saved.'); load();
+  } catch (e) {
+    document.getElementById('formErrors').textContent = e.message;
+  } finally { btn.disabled = false; }
+}
+
+async function delRow(id, alias) {
+  if (!confirm('Delete "' + alias + '"?')) return;
+  await fetch(API('/responders/' + id), { method: 'DELETE' });
+  flash('Deleted.'); load();
+}
+
+async function checkNow(id) {
+  flash('Checking…');
+  try {
+    await fetch(API('/responders/' + id + '/check'), { method: 'POST' });
+    flash('Check complete.'); load();
+  } catch (e) { flash('Check failed: ' + e.message); }
+}
+
+async function showHist(id, alias) {
+  document.getElementById('histTitle').textContent = 'History — ' + alias;
+  const body = document.getElementById('histBody');
+  body.innerHTML = '<span class="muted">Loading…</span>';
+  document.getElementById('histOverlay').classList.add('open');
+  const res = await fetch(API('/responders/' + id + '/history?limit=100'));
+  const data = await res.json();
+  if (!data.length) { body.innerHTML = '<span class="muted">No status changes recorded yet.</span>'; return; }
+  body.innerHTML = data.map(h =>
+    `<div class="hist-row">
+       <span><span class="badge ${h.status}">${h.status}</span> ${esc(h.message)}</span>
+       <span class="muted">${fmt(h.timestamp)}</span>
+     </div>`).join('');
+}
+function closeHist() { document.getElementById('histOverlay').classList.remove('open'); }
+
+async function openSettings() {
+  const res = await fetch(API('/settings'));
+  const s = await res.json();
+  document.getElementById('s_debug').checked = !!s.debug_logging;
+  document.getElementById('s_failures').checked = !!s.log_only_failures;
+  document.getElementById('s_kuma').checked = !!s.uptime_kuma_logging;
+  document.getElementById('settingsOverlay').classList.add('open');
+}
+function closeSettings() { document.getElementById('settingsOverlay').classList.remove('open'); }
+async function saveSettings() {
+  await fetch(API('/settings'), {
+    method: 'PUT', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({
+      debug_logging: document.getElementById('s_debug').checked,
+      log_only_failures: document.getElementById('s_failures').checked,
+      uptime_kuma_logging: document.getElementById('s_kuma').checked,
+    })
+  });
+  closeSettings(); flash('Settings saved.');
+}
+
+// Close modals on overlay click.
+document.querySelectorAll('.overlay').forEach(o =>
+  o.addEventListener('click', e => { if (e.target === o) o.classList.remove('open'); }));
+
+load();
+setInterval(load, 15000);  // poll for live status
+</script>
+</body>
+</html>

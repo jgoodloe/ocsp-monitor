@@ -1,0 +1,28 @@
+services:
+  ocsp-monitor:
+    build: .
+    # Or use a prebuilt image instead of build:
+    # image: ghcr.io/youruser/ocsp-monitor:latest
+    container_name: ocsp-monitor
+    restart: unless-stopped
+    ports:
+      # Host:Container. Point your reverse proxy upstream at this host port.
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      # Set to a subpath (e.g. "/ocsp") if your reverse proxy serves the app
+      # under a path rather than its own (sub)domain. Leave empty for root.
+      URL_PREFIX: "${URL_PREFIX:-}"
+      # Scheduler tick (seconds): how often due responders are evaluated.
+      SCHEDULER_INTERVAL: "${SCHEDULER_INTERVAL:-30}"
+      # Per-request OCSP HTTP timeout (seconds).
+      OCSP_TIMEOUT: "${OCSP_TIMEOUT:-30}"
+      # Rows of status history kept per responder.
+      HISTORY_LIMIT: "${HISTORY_LIMIT:-200}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+    volumes:
+      # Persistent SQLite database (survives container rebuilds).
+      - ocsp_data:/data
+
+volumes:
+  ocsp_data:

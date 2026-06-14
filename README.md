@@ -195,6 +195,39 @@ For each enabled responder whose `next_run` is due, the app:
 
 No `openssl` CLI is invoked — it's all in-process via `cryptography`.
 
+## Enabling / disabling a monitor
+
+Each responder can be enabled or disabled from its row (or the edit form). A
+disabled monitor is skipped by the scheduler. Every enable/disable (and the
+initial create) is written to an **audit log** with a timestamp, both for the
+trail (`GET /api/responders/{id}/audit`) and so uptime reports can account for
+the periods a monitor was intentionally off.
+
+## Uptime reports & maintenance windows
+
+Open **Reports** in the toolbar. Pick a time frame (quick ranges or custom
+from/to) and, optionally, specific monitors (none selected = all). Three views:
+
+- **Uptime** — per-monitor uptime %, with a breakdown of up / down / maintenance
+  / disabled / no-data time, and the list of downtimes in range. Each downtime
+  shows the **reason** (the error/status that caused it) and an editable
+  **comment** that's stored on the status-change event for future reports.
+- **All downtimes** — a single chronological list of every downtime across the
+  selected monitors for the period.
+- **Maintenance windows** — define windows (per monitor or for all monitors)
+  whose time is **excluded** from uptime calculations.
+
+Uptime is **time-weighted**: each status holds from its change until the next,
+and the percentage is up-time ÷ (up + down) over the window. Three options are
+chosen *at report time*:
+
+- **Down counts as** — *anything not Valid* (Revoked/Unknown/Error all count as
+  down) or *only errors* (Revoked/Unknown are treated as “answered” = up).
+- **Disabled periods** — *excluded* from totals, *counted as downtime*, or
+  *ignored* (use whatever status was last recorded).
+- **Exclude maintenance** — whether maintenance-window time is removed from
+  totals (downtimes inside a window are shown but flagged as excluded).
+
 ## Selectable verification tests
 
 Every step of a check is an individually selectable **test**, in two groups.
@@ -268,9 +301,21 @@ All endpoints are under `<prefix>/api`:
 | PUT | `/api/responders/{id}` | Update a responder. |
 | DELETE | `/api/responders/{id}` | Delete a responder. |
 | POST | `/api/responders/{id}/check` | Run a check now. |
-| GET | `/api/responders/{id}/history?limit=N` | Status-change history. |
+| POST | `/api/responders/{id}/enable` | Enable the monitor (audited). |
+| POST | `/api/responders/{id}/disable` | Disable the monitor (audited). |
+| GET | `/api/responders/{id}/history?limit=N` | Status-change history (with `id` + `comment`). |
+| GET | `/api/responders/{id}/audit` | Enable/disable/create audit log. |
+| PUT | `/api/history/{id}` | Set/clear the comment on a status-change row. |
+| GET/POST | `/api/maintenance` | List / create maintenance windows. |
+| DELETE | `/api/maintenance/{id}` | Delete a maintenance window. |
+| GET | `/api/reports/uptime` | Per-monitor uptime + downtimes for a window. |
+| GET | `/api/reports/downtimes` | Flat downtime list across selected monitors. |
 | GET | `/api/tests` | Catalogue of selectable verification tests (`key` + `label`). |
 | GET/PUT | `/api/settings` | Logging settings and the global `default_tests`. |
+
+The report endpoints accept `from`/`to` (ISO 8601), `responder_ids` (CSV; empty
+= all), `down_mode` (`not_valid`|`error_only`), `disabled_mode`
+(`exclude`|`down`|`ignore`), and `exclude_maintenance` (`true`|`false`).
 
 Responder objects carry a `tests` field: `null` means "inherit the global
 default set", and an array of test keys (e.g. `["cert_status","signature"]`)

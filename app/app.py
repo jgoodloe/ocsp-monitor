@@ -204,10 +204,37 @@ CREATE TABLE IF NOT EXISTS history (
     status       TEXT NOT NULL,
     message      TEXT NOT NULL DEFAULT '',
     timestamp    TEXT NOT NULL,
+    comment      TEXT,
     FOREIGN KEY (responder_id) REFERENCES responders(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_history_responder
     ON history(responder_id, timestamp DESC);
+
+-- Audit log of enable/disable (and create) events, used both for the audit
+-- trail and to exclude "disabled" periods from uptime reports.
+CREATE TABLE IF NOT EXISTS audit_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    responder_id INTEGER NOT NULL,
+    event        TEXT NOT NULL,          -- 'enabled' | 'disabled' | 'created'
+    timestamp    TEXT NOT NULL,
+    FOREIGN KEY (responder_id) REFERENCES responders(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_audit_responder
+    ON audit_events(responder_id, timestamp);
+
+-- Operator-defined maintenance windows excluded from uptime calculations.
+-- responder_id NULL means the window applies to every responder.
+CREATE TABLE IF NOT EXISTS maintenance_windows (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    responder_id INTEGER,
+    start_ts     TEXT NOT NULL,
+    end_ts       TEXT NOT NULL,
+    comment      TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL,
+    FOREIGN KEY (responder_id) REFERENCES responders(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_maint_responder
+    ON maintenance_windows(responder_id, start_ts);
 
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
@@ -257,6 +284,11 @@ def init_db():
                               ("response_time_ms", "INTEGER")):
             if col not in existing_cols:
                 db.execute(f"ALTER TABLE responders ADD COLUMN {col} {col_type}")
+        hist_cols = {
+            r["name"] for r in db.execute("PRAGMA table_info(history)").fetchall()
+        }
+        if "comment" not in hist_cols:
+            db.execute("ALTER TABLE history ADD COLUMN comment TEXT")
         for k, v in DEFAULT_SETTINGS.items():
             db.execute(
                 "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
@@ -272,6 +304,14 @@ def now_iso():
 def get_setting(db, key, default="false"):
     row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
     return row["value"] if row else default
+
+
+def add_audit(db, responder_id, event, ts=None):
+    """Record an enable/disable/create event for a responder."""
+    db.execute(
+        "INSERT INTO audit_events (responder_id, event, timestamp) VALUES (?, ?, ?)",
+        (responder_id, event, ts or now_iso()),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -869,12 +909,16 @@ def check_responder(db, row):
             "VALUES (?, ?, ?, ?)",
             (rid, result.status, result.message, now.isoformat()),
         )
-        # Trim history to HISTORY_LIMIT rows per responder.
+        # Trim history to HISTORY_LIMIT rows per responder, but never drop a
+        # row that carries an operator comment (it's referenced by reports).
         db.execute(
-            """DELETE FROM history WHERE responder_id=? AND id NOT IN (
-                   SELECT id FROM history WHERE responder_id=?
-                   ORDER BY timestamp DESC LIMIT ?
-               )""",
+            """DELETE FROM history
+                WHERE responder_id=?
+                  AND (comment IS NULL OR comment='')
+                  AND id NOT IN (
+                      SELECT id FROM history WHERE responder_id=?
+                      ORDER BY timestamp DESC LIMIT ?
+                  )""",
             (rid, rid, HISTORY_LIMIT),
         )
         log.info("[Worker] '%s' status changed %s -> %s", alias, prev_status, result.status)
@@ -924,6 +968,222 @@ def start_scheduler():
         t = threading.Thread(target=scheduler_loop, name="ocsp-scheduler", daemon=True)
         t.start()
         _scheduler_started = True
+
+
+# --------------------------------------------------------------------------- #
+# Uptime reporting engine
+# --------------------------------------------------------------------------- #
+# Status is recorded only on change, so each history row's status holds from its
+# timestamp until the next row. Uptime is the time-weighted fraction spent in an
+# "up" state over the window, with maintenance windows and (optionally) disabled
+# periods excluded. All interval math is on timezone-aware UTC datetimes.
+def _parse_ts(s):
+    if not s:
+        return None
+    s = s.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        # A '+' in a query string can arrive decoded as a space (e.g.
+        # "...00:00 00:00"); recover the offset rather than silently failing.
+        try:
+            dt = datetime.fromisoformat(s.replace(" ", "+"))
+        except ValueError:
+            return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _merge(intervals):
+    """Merge a list of (start, end) into sorted, non-overlapping intervals."""
+    ivs = sorted((s, e) for s, e in intervals if e > s)
+    out = []
+    for s, e in ivs:
+        if out and s <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], e))
+        else:
+            out.append((s, e))
+    return out
+
+
+def _subtract(base, cut):
+    """base minus cut (lists of (start, end))."""
+    cut = _merge(cut)
+    out = []
+    for s, e in _merge(base):
+        cur = s
+        for cs, ce in cut:
+            if ce <= cur or cs >= e:
+                continue
+            if cs > cur:
+                out.append((cur, min(cs, e)))
+            cur = max(cur, ce)
+            if cur >= e:
+                break
+        if cur < e:
+            out.append((cur, e))
+    return out
+
+
+def _intersect(a, b):
+    a, b = _merge(a), _merge(b)
+    out, i, j = [], 0, 0
+    while i < len(a) and j < len(b):
+        s = max(a[i][0], b[j][0])
+        e = min(a[i][1], b[j][1])
+        if e > s:
+            out.append((s, e))
+        if a[i][1] < b[j][1]:
+            i += 1
+        else:
+            j += 1
+    return out
+
+
+def _dur(intervals):
+    return sum((e - s).total_seconds() for s, e in intervals)
+
+
+def _clip_intervals(intervals, lo, hi):
+    out = []
+    for s, e in intervals:
+        s2, e2 = max(s, lo), min(e, hi)
+        if e2 > s2:
+            out.append((s2, e2))
+    return _merge(out)
+
+
+def _disabled_intervals(db, rid, win_start, win_end):
+    """Spans during which the responder was disabled, clipped to the window."""
+    events = db.execute(
+        "SELECT event, timestamp FROM audit_events WHERE responder_id=? "
+        "AND event IN ('enabled','disabled') ORDER BY timestamp",
+        (rid,),
+    ).fetchall()
+    spans, state, since = [], None, None
+    for ev in events:
+        t = _parse_ts(ev["timestamp"])
+        if t is None:
+            continue
+        if ev["event"] == "disabled":
+            if state != "disabled":
+                since, state = t, "disabled"
+        else:
+            if state == "disabled" and since is not None:
+                spans.append((since, t))
+                since = None
+            state = "enabled"
+    if state == "disabled" and since is not None:
+        spans.append((since, win_end))  # still disabled now
+    return _clip_intervals(spans, win_start, win_end)
+
+
+def _maintenance_intervals(db, rid, win_start, win_end):
+    rows = db.execute(
+        "SELECT start_ts, end_ts FROM maintenance_windows "
+        "WHERE responder_id=? OR responder_id IS NULL",
+        (rid,),
+    ).fetchall()
+    spans = []
+    for r in rows:
+        s, e = _parse_ts(r["start_ts"]), _parse_ts(r["end_ts"])
+        if s and e:
+            spans.append((s, e))
+    return _clip_intervals(spans, win_start, win_end)
+
+
+def _status_segments(db, rid, win_start, win_end):
+    """List of (start, end, row) over the window; row is None for no-data gaps."""
+    rows = db.execute(
+        "SELECT id, status, message, timestamp, comment FROM history "
+        "WHERE responder_id=? ORDER BY timestamp",
+        (rid,),
+    ).fetchall()
+    seed, mids = None, []
+    for r in rows:
+        t = _parse_ts(r["timestamp"])
+        if t is None:
+            continue
+        if t <= win_start:
+            seed = r
+        elif t < win_end:
+            mids.append((t, r))
+    segs, cursor, cur = [], win_start, seed
+    for t, r in mids:
+        segs.append((cursor, t, cur))
+        cursor, cur = t, r
+    segs.append((cursor, win_end, cur))
+    return segs
+
+
+def _is_up(status, down_mode):
+    if status is None:
+        return None
+    if status == "Valid":
+        return True
+    if down_mode == "error_only":
+        return status != "Error"   # Revoked / Unknown count as "up" (answered)
+    return False                   # not_valid: anything other than Valid is down
+
+
+def compute_uptime(db, rid, win_start, win_end, down_mode="not_valid",
+                   exclude_maintenance=True, disabled_mode="exclude"):
+    """Time-weighted uptime over [win_start, win_end] for one responder."""
+    up, down, nodata, downtimes = [], [], [], []
+    for s, e, row in _status_segments(db, rid, win_start, win_end):
+        if row is None:
+            nodata.append((s, e))
+            continue
+        if _is_up(row["status"], down_mode):
+            up.append((s, e))
+        else:
+            down.append((s, e))
+            downtimes.append({
+                "hist_id": row["id"], "status": row["status"],
+                "reason": row["message"], "comment": row["comment"],
+                "_start": s, "_end": e,
+            })
+
+    maint = _maintenance_intervals(db, rid, win_start, win_end) if exclude_maintenance else []
+    disabled = _disabled_intervals(db, rid, win_start, win_end)
+
+    disabled_excluded = []
+    if disabled_mode == "exclude":
+        disabled_excluded = disabled
+        up, down = _subtract(up, disabled), _subtract(down, disabled)
+    elif disabled_mode == "down":
+        moved = _intersect(up, disabled)      # "up" time while disabled -> down
+        up = _subtract(up, disabled)
+        down = _merge(down + moved)
+    # "ignore": leave classification untouched
+
+    if maint:
+        up, down = _subtract(up, maint), _subtract(down, maint)
+        disabled_excluded = _subtract(disabled_excluded, maint)
+        nodata = _subtract(nodata, maint)
+
+    up_s, down_s = _dur(up), _dur(down)
+    denom = up_s + down_s
+    uptime_pct = round(100.0 * up_s / denom, 4) if denom > 0 else None
+
+    # Flag downtimes fully inside excluded (maintenance / disabled) time.
+    flag_excl = _merge(maint + (disabled if disabled_mode == "exclude" else []))
+    for d in downtimes:
+        visible = _subtract([(d["_start"], d["_end"])], flag_excl)
+        d["excluded"] = _dur(visible) == 0
+        d["duration_s"] = (d["_end"] - d["_start"]).total_seconds()
+        d["start"], d["end"] = d.pop("_start").isoformat(), d.pop("_end").isoformat()
+
+    return {
+        "uptime_pct": uptime_pct,
+        "up_seconds": up_s,
+        "down_seconds": down_s,
+        "maintenance_seconds": _dur(maint),
+        "disabled_seconds": _dur(disabled_excluded) if disabled_mode == "exclude" else 0.0,
+        "nodata_seconds": _dur(nodata),
+        "downtimes": downtimes,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -1171,6 +1431,9 @@ def create_responder():
             now,
         ),
     )
+    # Seed the audit log so disabled-period math has a clean starting point.
+    add_audit(db, cur.lastrowid, "created")
+    add_audit(db, cur.lastrowid, "enabled" if data.get("enabled", True) else "disabled")
     db.commit()
     row = db.execute("SELECT * FROM responders WHERE id=?", (cur.lastrowid,)).fetchone()
     return jsonify(responder_to_dict(row)), 201
@@ -1223,9 +1486,53 @@ def update_responder(rid):
             next_run, now_iso(), rid,
         ),
     )
+    # Audit an enable/disable that happened via the edit form.
+    if fields["enabled"] != int(bool(row["enabled"])):
+        add_audit(db, rid, "enabled" if fields["enabled"] else "disabled")
     db.commit()
     row = db.execute("SELECT * FROM responders WHERE id=?", (rid,)).fetchone()
     return jsonify(responder_to_dict(row))
+
+
+def _set_enabled(rid, enabled):
+    """Shared enable/disable: update the flag, audit it, reschedule if enabling."""
+    db = get_db()
+    row = db.execute("SELECT * FROM responders WHERE id=?", (rid,)).fetchone()
+    if not row:
+        return jsonify({"message": "Not found"}), 404
+    if bool(row["enabled"]) == enabled:
+        return jsonify(responder_to_dict(row, include_pem=False))  # no-op
+    # Enabling schedules an immediate check; disabling leaves next_run as-is.
+    next_run = now_iso() if enabled else row["next_run"]
+    db.execute(
+        "UPDATE responders SET enabled=?, next_run=?, updated_at=? WHERE id=?",
+        (1 if enabled else 0, next_run, now_iso(), rid),
+    )
+    add_audit(db, rid, "enabled" if enabled else "disabled")
+    db.commit()
+    row = db.execute("SELECT * FROM responders WHERE id=?", (rid,)).fetchone()
+    return jsonify(responder_to_dict(row, include_pem=False))
+
+
+@app.route("/api/responders/<int:rid>/enable", methods=["POST"])
+def enable_responder(rid):
+    return _set_enabled(rid, True)
+
+
+@app.route("/api/responders/<int:rid>/disable", methods=["POST"])
+def disable_responder(rid):
+    return _set_enabled(rid, False)
+
+
+@app.route("/api/responders/<int:rid>/audit", methods=["GET"])
+def responder_audit(rid):
+    db = get_db()
+    rows = db.execute(
+        "SELECT event, timestamp FROM audit_events WHERE responder_id=? "
+        "ORDER BY timestamp DESC LIMIT 200",
+        (rid,),
+    ).fetchall()
+    return jsonify([dict(r) for r in rows])
 
 
 @app.route("/api/responders/<int:rid>", methods=["DELETE"])
@@ -1255,11 +1562,131 @@ def responder_history(rid):
     db = get_db()
     limit = min(int(request.args.get("limit", 50)), HISTORY_LIMIT)
     rows = db.execute(
-        "SELECT status, message, timestamp FROM history "
+        "SELECT id, status, message, timestamp, comment FROM history "
         "WHERE responder_id=? ORDER BY timestamp DESC LIMIT ?",
         (rid, limit),
     ).fetchall()
     return jsonify([dict(r) for r in rows])
+
+
+# ---- Downtime comments ---- #
+@app.route("/api/history/<int:hid>", methods=["PUT"])
+def update_history_comment(hid):
+    """Attach (or clear) an operator comment on a status-change row."""
+    data = request.get_json(silent=True) or {}
+    comment = (data.get("comment") or "").strip()
+    db = get_db()
+    cur = db.execute("UPDATE history SET comment=? WHERE id=?", (comment or None, hid))
+    db.commit()
+    if cur.rowcount == 0:
+        return jsonify({"message": "Not found"}), 404
+    row = db.execute(
+        "SELECT id, status, message, timestamp, comment FROM history WHERE id=?", (hid,)
+    ).fetchone()
+    return jsonify(dict(row))
+
+
+# ---- Maintenance windows ---- #
+@app.route("/api/maintenance", methods=["GET"])
+def list_maintenance():
+    db = get_db()
+    rid = request.args.get("responder_id")
+    if rid and rid.isdigit():
+        rows = db.execute(
+            "SELECT * FROM maintenance_windows WHERE responder_id=? OR responder_id IS NULL "
+            "ORDER BY start_ts DESC", (int(rid),),
+        ).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT * FROM maintenance_windows ORDER BY start_ts DESC"
+        ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/maintenance", methods=["POST"])
+def create_maintenance():
+    data = request.get_json(silent=True) or {}
+    s, e = _parse_ts(data.get("start")), _parse_ts(data.get("end"))
+    if not s or not e or e <= s:
+        return jsonify({"message": "Valid 'start' and 'end' (end after start) are required."}), 400
+    db = get_db()
+    rid = data.get("responder_id")
+    rid = int(rid) if (rid not in (None, "") and str(rid).isdigit()) else None
+    if rid is not None and not db.execute(
+            "SELECT 1 FROM responders WHERE id=?", (rid,)).fetchone():
+        return jsonify({"message": "Unknown responder_id."}), 400
+    cur = db.execute(
+        "INSERT INTO maintenance_windows (responder_id, start_ts, end_ts, comment, created_at) "
+        "VALUES (?,?,?,?,?)",
+        (rid, s.isoformat(), e.isoformat(), (data.get("comment") or "").strip(), now_iso()),
+    )
+    db.commit()
+    row = db.execute("SELECT * FROM maintenance_windows WHERE id=?", (cur.lastrowid,)).fetchone()
+    return jsonify(dict(row)), 201
+
+
+@app.route("/api/maintenance/<int:mid>", methods=["DELETE"])
+def delete_maintenance(mid):
+    db = get_db()
+    cur = db.execute("DELETE FROM maintenance_windows WHERE id=?", (mid,))
+    db.commit()
+    if cur.rowcount == 0:
+        return jsonify({"message": "Not found"}), 404
+    return ("", 204)
+
+
+# ---- Reports ---- #
+def _report_params():
+    args = request.args
+    win_end = _parse_ts(args.get("to")) or datetime.now(timezone.utc)
+    win_start = _parse_ts(args.get("from")) or (win_end - timedelta(days=30))
+    ids = (args.get("responder_ids") or "").strip()
+    rid_list = [int(x) for x in ids.split(",") if x.strip().isdigit()] if ids else None
+    down_mode = args.get("down_mode", "not_valid")
+    if down_mode not in ("not_valid", "error_only"):
+        down_mode = "not_valid"
+    exclude_maint = (args.get("exclude_maintenance", "true").lower() != "false")
+    disabled_mode = args.get("disabled_mode", "exclude")
+    if disabled_mode not in ("exclude", "down", "ignore"):
+        disabled_mode = "exclude"
+    return win_start, win_end, rid_list, down_mode, exclude_maint, disabled_mode
+
+
+def _selected_responders(db, rid_list):
+    rows = db.execute("SELECT id, cert_alias FROM responders ORDER BY cert_alias").fetchall()
+    return [r for r in rows if rid_list is None or r["id"] in rid_list]
+
+
+@app.route("/api/reports/uptime", methods=["GET"])
+def report_uptime():
+    db = get_db()
+    ws, we, ids, dm, em, dim = _report_params()
+    if we <= ws:
+        return jsonify({"message": "'to' must be after 'from'."}), 400
+    out = []
+    for r in _selected_responders(db, ids):
+        rep = compute_uptime(db, r["id"], ws, we, dm, em, dim)
+        rep["responder_id"], rep["cert_alias"] = r["id"], r["cert_alias"]
+        out.append(rep)
+    return jsonify({
+        "from": ws.isoformat(), "to": we.isoformat(), "down_mode": dm,
+        "exclude_maintenance": em, "disabled_mode": dim, "responders": out,
+    })
+
+
+@app.route("/api/reports/downtimes", methods=["GET"])
+def report_downtimes():
+    db = get_db()
+    ws, we, ids, dm, em, dim = _report_params()
+    if we <= ws:
+        return jsonify({"message": "'to' must be after 'from'."}), 400
+    items = []
+    for r in _selected_responders(db, ids):
+        rep = compute_uptime(db, r["id"], ws, we, dm, em, dim)
+        for d in rep["downtimes"]:
+            items.append({**d, "responder_id": r["id"], "cert_alias": r["cert_alias"]})
+    items.sort(key=lambda d: d["start"])
+    return jsonify({"from": ws.isoformat(), "to": we.isoformat(), "downtimes": items})
 
 
 # ---- Tests registry ---- #

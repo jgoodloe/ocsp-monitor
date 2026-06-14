@@ -95,6 +95,29 @@
   .pill.pass { background: rgba(34,197,94,.12); color: var(--good); border-color: rgba(34,197,94,.3); }
   .pill.fail { background: rgba(239,68,68,.12); color: var(--bad); border-color: rgba(239,68,68,.3); }
   .pill.skip { background: rgba(100,116,139,.15); color: var(--muted); }
+  .modal.wide { max-width: 880px; }
+  .rep-controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
+  .rep-controls > div { display: flex; flex-direction: column; }
+  .rep-controls input[type=datetime-local], .rep-controls select { width: auto; }
+  .rep-tabs { display: flex; gap: 6px; margin: 16px 0 10px; }
+  .rep-tabs button.active { background: var(--accent2); color: #00121f; }
+  .mon-list { display: flex; flex-wrap: wrap; gap: 4px 14px; max-height: 96px; overflow:auto;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; }
+  .mon-list .check { margin: 0; }
+  .uptime-card { background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px 14px; margin-bottom: 10px; }
+  .uptime-head { display:flex; justify-content:space-between; align-items:baseline; gap:10px; }
+  .uptime-pct { font-size: 20px; font-weight: 800; }
+  .bar { height: 8px; border-radius: 4px; background: var(--bad); overflow: hidden; margin: 8px 0; }
+  .bar > span { display:block; height:100%; background: var(--good); }
+  .dt-row { display:grid; grid-template-columns: 150px 80px 1fr; gap: 8px; padding: 6px 0;
+    border-top: 1px dashed var(--border); align-items: start; }
+  .dt-row.head { color: var(--muted); font-weight:600; border-top: 0; }
+  .dt-comment { display:flex; gap:6px; margin-top:4px; }
+  .dt-comment input { padding: 5px 8px; }
+  .excluded-tag { color: var(--muted); font-size: 11px; }
+  .maint-row { display:flex; justify-content:space-between; gap:10px; padding:6px 0;
+    border-top: 1px dashed var(--border); align-items:center; }
 </style>
 </head>
 <body>
@@ -102,6 +125,7 @@
   <h1><span class="dot"></span> OCSP Monitor</h1>
   <div class="toolbar">
     <span class="msg muted" id="globalMsg"></span>
+    <button class="secondary" onclick="openReports()">Reports</button>
     <button class="secondary" onclick="openSettings()">Settings</button>
     <button onclick="openForm()">+ Add responder</button>
   </div>
@@ -208,6 +232,70 @@
   </div>
 </div>
 
+<!-- Reports modal -->
+<div class="overlay" id="reportsOverlay">
+  <div class="modal wide">
+    <h2>Reports</h2>
+    <div class="rep-controls">
+      <div>
+        <label style="margin:0 0 4px">From</label>
+        <input type="datetime-local" id="rep_from">
+      </div>
+      <div>
+        <label style="margin:0 0 4px">To</label>
+        <input type="datetime-local" id="rep_to">
+      </div>
+      <div>
+        <label style="margin:0 0 4px">Quick range</label>
+        <select id="rep_quick" onchange="applyQuickRange()">
+          <option value="">Custom</option>
+          <option value="24">Last 24 hours</option>
+          <option value="168" selected>Last 7 days</option>
+          <option value="720">Last 30 days</option>
+          <option value="2160">Last 90 days</option>
+        </select>
+      </div>
+      <div>
+        <label style="margin:0 0 4px">Down counts as</label>
+        <select id="rep_down">
+          <option value="not_valid">Anything not Valid</option>
+          <option value="error_only">Only errors (Revoked/Unknown = up)</option>
+        </select>
+      </div>
+      <div>
+        <label style="margin:0 0 4px">Disabled periods</label>
+        <select id="rep_disabled">
+          <option value="exclude">Excluded from totals</option>
+          <option value="down">Count as downtime</option>
+          <option value="ignore">Ignore (use status)</option>
+        </select>
+      </div>
+      <div class="check" style="margin:0">
+        <input type="checkbox" id="rep_maint" checked>
+        <label for="rep_maint" style="margin:0">Exclude maintenance</label>
+      </div>
+    </div>
+
+    <label style="margin-top:12px">Monitors</label>
+    <div class="muted small" style="margin-bottom:6px">None selected = all monitors.</div>
+    <div id="rep_monitors" class="mon-list"></div>
+
+    <div class="rep-tabs">
+      <button class="secondary" id="rep_tab_uptime" onclick="setReportTab('uptime')">Uptime</button>
+      <button class="secondary" id="rep_tab_downtimes" onclick="setReportTab('downtimes')">All downtimes</button>
+      <button class="secondary" id="rep_tab_maint" onclick="setReportTab('maint')">Maintenance windows</button>
+      <span style="flex:1"></span>
+      <button onclick="runReport()">Run report</button>
+    </div>
+
+    <div id="rep_body" class="small"></div>
+
+    <div class="modal-actions">
+      <button class="secondary" onclick="closeReports()">Close</button>
+    </div>
+  </div>
+</div>
+
 <script>
 // All API calls are RELATIVE to the current page — this is what makes the app
 // work behind a reverse proxy at any subpath without configuration.
@@ -308,6 +396,7 @@ async function load() {
         <td class="small">${r.frequency_min}m</td>
         <td><div class="actions">
           <button class="secondary tiny" onclick="checkNow(${r.id})">Check</button>
+          <button class="secondary tiny" onclick="toggleEnabled(${r.id}, ${r.enabled ? 'true' : 'false'})">${r.enabled ? 'Disable' : 'Enable'}</button>
           <button class="secondary tiny" onclick="showHist(${r.id}, '${esc(r.cert_alias)}')">History</button>
           <button class="secondary tiny" onclick="editRow(${r.id})">Edit</button>
           <button class="danger tiny" onclick="delRow(${r.id}, '${esc(r.cert_alias)}')">Del</button>
@@ -417,6 +506,13 @@ async function checkNow(id) {
   } catch (e) { flash('Check failed: ' + e.message); }
 }
 
+async function toggleEnabled(id, currentlyEnabled) {
+  const action = currentlyEnabled ? 'disable' : 'enable';
+  const res = await mutate(API('/responders/' + id + '/' + action), 'POST');
+  flash(res.ok ? (currentlyEnabled ? 'Disabled.' : 'Enabled.') : 'Action failed.');
+  load();
+}
+
 async function showHist(id, alias) {
   document.getElementById('histTitle').textContent = 'History — ' + alias;
   const body = document.getElementById('histBody');
@@ -455,6 +551,165 @@ async function saveSettings() {
   });
   globalDefaultTests = selectedTests('s_tests_box');
   closeSettings(); flash('Settings saved.');
+}
+
+// ---- Reports ----
+let reportTab = 'uptime';
+let repMonitors = [];
+
+function pad(n) { return String(n).padStart(2, '0'); }
+function toLocalInput(d) {
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+function fmtDur(s) {
+  s = Math.round(s || 0);
+  const d = Math.floor(s/86400); s %= 86400;
+  const h = Math.floor(s/3600); s %= 3600;
+  const m = Math.floor(s/60);
+  const parts = [];
+  if (d) parts.push(d + 'd');
+  if (h) parts.push(h + 'h');
+  if (m || (!d && !h)) parts.push(m + 'm');
+  return parts.join(' ');
+}
+
+function applyQuickRange() {
+  const h = parseInt(document.getElementById('rep_quick').value);
+  if (!h) return;
+  document.getElementById('rep_to').value = toLocalInput(new Date());
+  document.getElementById('rep_from').value = toLocalInput(new Date(Date.now() - h*3600*1000));
+}
+
+async function openReports() {
+  repMonitors = await (await fetch(API('/responders'))).json();
+  document.getElementById('rep_monitors').innerHTML = repMonitors.length
+    ? repMonitors.map(m => `<div class="check"><input type="checkbox" class="rep-mon" value="${m.id}" id="rm_${m.id}"><label for="rm_${m.id}" style="margin:0">${esc(m.cert_alias)}</label></div>`).join('')
+    : '<span class="muted">No monitors configured.</span>';
+  document.getElementById('rep_quick').value = '168';
+  applyQuickRange();
+  setReportTab('uptime');
+  document.getElementById('reportsOverlay').classList.add('open');
+}
+function closeReports() { document.getElementById('reportsOverlay').classList.remove('open'); }
+
+function selectedMonitorIds() {
+  return [...document.querySelectorAll('.rep-mon:checked')].map(c => c.value).join(',');
+}
+function repParams() {
+  const p = new URLSearchParams();
+  const f = document.getElementById('rep_from').value, t = document.getElementById('rep_to').value;
+  if (f) p.set('from', new Date(f).toISOString());
+  if (t) p.set('to', new Date(t).toISOString());
+  const ids = selectedMonitorIds(); if (ids) p.set('responder_ids', ids);
+  p.set('down_mode', document.getElementById('rep_down').value);
+  p.set('disabled_mode', document.getElementById('rep_disabled').value);
+  p.set('exclude_maintenance', document.getElementById('rep_maint').checked ? 'true' : 'false');
+  return p;
+}
+
+function setReportTab(tab) {
+  reportTab = tab;
+  ['uptime', 'downtimes', 'maint'].forEach(t =>
+    document.getElementById('rep_tab_' + t).classList.toggle('active', t === tab));
+  runReport();
+}
+
+async function runReport() {
+  const body = document.getElementById('rep_body');
+  body.innerHTML = '<span class="muted">Loading…</span>';
+  try {
+    if (reportTab === 'maint') return renderMaint();
+    const path = reportTab === 'uptime' ? '/reports/uptime' : '/reports/downtimes';
+    const res = await fetch(API(path) + '?' + repParams().toString());
+    const data = await res.json();
+    if (!res.ok) { body.innerHTML = esc(data.message || 'Report failed.'); return; }
+    reportTab === 'uptime' ? renderUptime(data) : renderDowntimes(data);
+  } catch (e) { body.innerHTML = esc(e.message); }
+}
+
+function downtimeRow(d, showMonitor) {
+  const tag = d.excluded ? ' <span class="excluded-tag">(maintenance/disabled — excluded)</span>' : '';
+  const mon = showMonitor ? `<b>${esc(d.cert_alias)}</b> · ` : '';
+  return `<div class="dt-row">
+    <span class="small">${fmt(d.start)}</span>
+    <span class="small">${fmtDur(d.duration_s)}</span>
+    <span><span class="badge ${d.status}">${d.status}</span> ${mon}${esc(d.reason || '')}${tag}
+      <div class="dt-comment">
+        <input type="text" id="cmt_${d.hist_id}" placeholder="Add a comment…" value="${esc(d.comment || '')}">
+        <button class="secondary tiny" onclick="saveComment(${d.hist_id})">Save</button>
+      </div>
+    </span></div>`;
+}
+
+function renderUptime(data) {
+  const body = document.getElementById('rep_body');
+  if (!data.responders.length) { body.innerHTML = '<span class="muted">No monitors selected.</span>'; return; }
+  body.innerHTML = data.responders.map(r => {
+    const pct = r.uptime_pct == null ? 'n/a' : r.uptime_pct.toFixed(3) + '%';
+    const w = r.uptime_pct == null ? 0 : r.uptime_pct;
+    const dts = r.downtimes.length
+      ? `<div class="dt-row head"><span>Started</span><span>Duration</span><span>Reason / comment</span></div>`
+        + r.downtimes.map(d => downtimeRow(d, false)).join('')
+      : '<div class="muted small" style="margin-top:6px">No downtimes in range.</div>';
+    return `<div class="uptime-card">
+      <div class="uptime-head"><b>${esc(r.cert_alias)}</b><span class="uptime-pct">${pct}</span></div>
+      <div class="bar"><span style="width:${w}%"></span></div>
+      <div class="muted small">up ${fmtDur(r.up_seconds)} · down ${fmtDur(r.down_seconds)} · maintenance ${fmtDur(r.maintenance_seconds)} · disabled ${fmtDur(r.disabled_seconds)} · no-data ${fmtDur(r.nodata_seconds)}</div>
+      ${dts}</div>`;
+  }).join('');
+}
+
+function renderDowntimes(data) {
+  const body = document.getElementById('rep_body');
+  if (!data.downtimes.length) { body.innerHTML = '<span class="muted">No downtimes in range.</span>'; return; }
+  body.innerHTML = `<div class="dt-row head"><span>Started</span><span>Duration</span><span>Monitor / reason / comment</span></div>`
+    + data.downtimes.map(d => downtimeRow(d, true)).join('');
+}
+
+async function saveComment(hid) {
+  const val = document.getElementById('cmt_' + hid).value;
+  const res = await mutate(API('/history/' + hid), 'PUT', { comment: val });
+  flash(res.ok ? 'Comment saved.' : 'Save failed.');
+}
+
+async function renderMaint() {
+  const body = document.getElementById('rep_body');
+  body.innerHTML = '<span class="muted">Loading…</span>';
+  const rows = await (await fetch(API('/maintenance'))).json();
+  const monOpts = '<option value="">All monitors</option>'
+    + repMonitors.map(m => `<option value="${m.id}">${esc(m.cert_alias)}</option>`).join('');
+  const add = `<div class="uptime-card"><b>Add maintenance window</b>
+    <div class="rep-controls" style="margin-top:8px">
+      <div><label style="margin:0 0 4px">Monitor</label><select id="mw_mon">${monOpts}</select></div>
+      <div><label style="margin:0 0 4px">Start</label><input type="datetime-local" id="mw_start"></div>
+      <div><label style="margin:0 0 4px">End</label><input type="datetime-local" id="mw_end"></div>
+      <div style="flex:1;min-width:140px"><label style="margin:0 0 4px">Comment</label><input type="text" id="mw_comment" placeholder="reason"></div>
+      <div><button onclick="addMaint()">Add</button></div>
+    </div></div>`;
+  const list = rows.length ? rows.map(w => {
+    const who = w.responder_id == null ? 'All monitors'
+      : ((repMonitors.find(m => m.id === w.responder_id) || {}).cert_alias || ('#' + w.responder_id));
+    return `<div class="maint-row"><span><b>${esc(who)}</b> · ${fmt(w.start_ts)} → ${fmt(w.end_ts)}${w.comment ? ' · ' + esc(w.comment) : ''}</span>
+      <button class="danger tiny" onclick="delMaint(${w.id})">Delete</button></div>`;
+  }).join('') : '<div class="muted small" style="margin-top:8px">No maintenance windows defined.</div>';
+  body.innerHTML = add + list;
+}
+
+async function addMaint() {
+  const s = document.getElementById('mw_start').value, e = document.getElementById('mw_end').value;
+  if (!s || !e) { flash('Start and end are required.'); return; }
+  const payload = { start: new Date(s).toISOString(), end: new Date(e).toISOString(),
+                    comment: document.getElementById('mw_comment').value };
+  const mon = document.getElementById('mw_mon').value;
+  if (mon) payload.responder_id = parseInt(mon);
+  const res = await mutate(API('/maintenance'), 'POST', payload);
+  if (res.ok) { flash('Maintenance window added.'); renderMaint(); }
+  else { const er = await res.json().catch(() => ({})); flash(er.message || 'Add failed.'); }
+}
+async function delMaint(id) {
+  if (!confirm('Delete this maintenance window?')) return;
+  const res = await mutate(API('/maintenance/' + id), 'DELETE');
+  flash(res.ok ? 'Deleted.' : 'Delete failed.'); renderMaint();
 }
 
 // Close modals on overlay click.

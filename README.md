@@ -135,6 +135,44 @@ For each enabled responder whose `next_run` is due, the app:
 
 No `openssl` CLI is invoked — it's all in-process via `cryptography`.
 
+## Selectable verification tests
+
+The foundational steps — reach the responder, get HTTP 200, parse the DER, and
+confirm `responseStatus == successful` — always run, because without them there
+is nothing to evaluate. Beyond that, you choose which **tests** decide a
+responder's status:
+
+| Test | What it checks |
+|---|---|
+| **Certificate status** | The certificate is `GOOD` — not `REVOKED` or `UNKNOWN`. |
+| **CertID serial match** | The response's `CertID` serial number matches the certificate you asked about (guards against mismatched/substituted responses). |
+| **Response signature** | The OCSP response is cryptographically signed by the issuer, or by a delegated responder cert that carries the `id-kp-OCSPSigning` EKU and was itself issued by that CA. |
+| **Signing-cert validity** | The certificate that signed the response (issuer or delegated responder) is currently within its `notBefore`/`notAfter` window. |
+| **thisUpdate sanity** | `thisUpdate` is present and not future-dated (allowing 5 min of clock skew). |
+| **nextUpdate freshness** | `nextUpdate` is present and not already in the past (stale responder). |
+| **Nonce echo** | A random nonce is sent with the request and the response must echo it back (RFC 8954) — detects replayed/cached responses. Off by default, since many responders don't support nonces. |
+| **Response-time threshold** | The responder's round-trip time is under a configurable limit (ms). Off by default. |
+
+Selection works at two levels:
+
+- **Global default** (Settings → *Default verification tests*) applies to every
+  responder that doesn't override it. Stored in the `default_tests` setting. The
+  default set is everything *except* **Nonce echo** and **Response-time
+  threshold**, which are opt-in.
+- **Per responder** (Add/Edit → *Verification tests*) either inherits the global
+  default or pins its own set. Untick **Use the global default set** to choose.
+
+The **Response-time threshold** test reads its limit from the responder's own
+*Response-time threshold (ms)* field, falling back to the global
+*Default response-time threshold* in Settings (`default_response_time_ms`,
+2000 ms out of the box).
+
+The dashboard shows a coloured pill per test on each responder's row (green =
+pass, red = fail, grey = skipped), and the overall status reflects only the
+tests you enabled — e.g. disabling **Certificate status** means a revoked cert
+won't flip the responder to `Revoked`, and disabling **nextUpdate freshness**
+means a stale response won't be flagged as an error.
+
 > **Note on public web certs:** Many public CAs have stopped including OCSP in
 > their certificates (the CA/Browser Forum made OCSP optional in 2024). This
 > tool is aimed at PKIs where OCSP is still required — e.g. federal PIV/PIV-I —
@@ -154,7 +192,14 @@ All endpoints are under `<prefix>/api`:
 | DELETE | `/api/responders/{id}` | Delete a responder. |
 | POST | `/api/responders/{id}/check` | Run a check now. |
 | GET | `/api/responders/{id}/history?limit=N` | Status-change history. |
-| GET/PUT | `/api/settings` | Logging settings. |
+| GET | `/api/tests` | Catalogue of selectable verification tests (`key` + `label`). |
+| GET/PUT | `/api/settings` | Logging settings and the global `default_tests`. |
+
+Responder objects carry a `tests` field: `null` means "inherit the global
+default set", and an array of test keys (e.g. `["cert_status","signature"]`)
+pins that responder's own selection. A `response_time_ms` field (or `null` to
+inherit the global default) sets the limit for the response-time test. The most
+recent per-test outcomes are returned in `last_checks`.
 
 ## Data & backup
 

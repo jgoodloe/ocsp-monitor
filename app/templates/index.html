@@ -81,6 +81,17 @@
   .settings-row { display:flex; align-items:center; gap:10px; padding:8px 0; }
   .settings-row input { width:auto; }
   code { background: var(--bg); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  .tests-box { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px; }
+  .tests-box.disabled { opacity: .45; pointer-events: none; }
+  .tests-box .check { margin: 0; }
+  .tests-box label { margin: 0; color: var(--text); }
+  .check-pills { display: flex; flex-wrap: wrap; gap: 4px; }
+  .pill { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px;
+    font-weight: 600; border: 1px solid var(--border); }
+  .pill.pass { background: rgba(34,197,94,.12); color: var(--good); border-color: rgba(34,197,94,.3); }
+  .pill.fail { background: rgba(239,68,68,.12); color: var(--bad); border-color: rgba(239,68,68,.3); }
+  .pill.skip { background: rgba(100,116,139,.15); color: var(--muted); }
 </style>
 </head>
 <body>
@@ -132,6 +143,22 @@
       <input type="checkbox" id="f_enabled" checked>
       <label for="f_enabled" style="margin:0">Enabled</label>
     </div>
+
+    <label style="margin-top:18px">Verification tests</label>
+    <div class="muted small" style="margin-bottom:6px">
+      Foundational reachability, HTTP 200 and response parsing always run. Choose
+      which additional tests determine this responder's status.
+    </div>
+    <div class="check">
+      <input type="checkbox" id="f_tests_inherit" onchange="toggleTestInherit()">
+      <label for="f_tests_inherit" style="margin:0">Use the global default set</label>
+    </div>
+    <div id="f_tests_box" class="tests-box"></div>
+
+    <label style="margin-top:14px">Response-time threshold (ms)
+      <span class="muted">— only used by the “Response-time threshold” test; blank inherits the global default</span></label>
+    <input type="number" id="f_resptime" min="1" placeholder="inherit global default">
+
     <div class="errors" id="formErrors"></div>
     <div class="modal-actions">
       <button class="secondary" onclick="closeForm()">Cancel</button>
@@ -164,6 +191,13 @@
     <div class="settings-row">
       <input type="checkbox" id="s_kuma"><label for="s_kuma" style="margin:0">Log Uptime Kuma pushes</label>
     </div>
+    <label style="margin-top:16px">Default verification tests</label>
+    <div class="muted small" style="margin-bottom:6px">
+      Applied to any responder set to “Use the global default set”.
+    </div>
+    <div id="s_tests_box" class="tests-box"></div>
+    <label style="margin-top:16px">Default response-time threshold (ms)</label>
+    <input type="number" id="s_resptime" min="1" placeholder="2000">
     <div class="modal-actions">
       <button class="secondary" onclick="closeSettings()">Cancel</button>
       <button onclick="saveSettings()">Save</button>
@@ -179,6 +213,41 @@ const API = (p) => {
   return base + "/api" + p;
 };
 let editingId = null;
+let AVAILABLE_TESTS = [];          // [{key,label}] from /api/tests
+let globalDefaultTests = [];       // current global default set
+
+// Short labels for the compact result pills in the table.
+const SHORT_TEST = {
+  cert_status: 'status', cert_id_match: 'certID', signature: 'signature',
+  signing_cert_validity: 'signerValid', this_update: 'thisUpdate',
+  next_update: 'nextUpdate', nonce: 'nonce', response_time: 'respTime',
+};
+
+async function loadTests() {
+  try { AVAILABLE_TESTS = await (await fetch(API('/tests'))).json(); }
+  catch (e) { AVAILABLE_TESTS = []; }
+}
+
+function renderTestChecks(boxId, prefix, selected) {
+  selected = selected || [];
+  document.getElementById(boxId).innerHTML = AVAILABLE_TESTS.map(t => `
+    <div class="check">
+      <input type="checkbox" id="${prefix}${t.key}" value="${t.key}" ${selected.includes(t.key) ? 'checked' : ''}>
+      <label for="${prefix}${t.key}">${esc(t.label)}</label>
+    </div>`).join('');
+}
+
+function selectedTests(boxId) {
+  return [...document.querySelectorAll('#' + boxId + ' input[type=checkbox]:checked')]
+    .map(c => c.value);
+}
+
+function toggleTestInherit() {
+  const inherit = document.getElementById('f_tests_inherit').checked;
+  const box = document.getElementById('f_tests_box');
+  if (inherit) renderTestChecks('f_tests_box', 'f_t_', globalDefaultTests);
+  box.classList.toggle('disabled', inherit);
+}
 
 function fmt(dt) {
   if (!dt) return '—';
@@ -204,7 +273,7 @@ async function load() {
       tr.innerHTML = `
         <td><b>${esc(r.cert_alias)}</b>${r.enabled ? '' : ' <span class="muted small">(disabled)</span>'}</td>
         <td><span class="badge ${r.status}">${r.status}</span></td>
-        <td class="muted small">${esc(r.last_message || '')}</td>
+        <td class="muted small">${esc(r.last_message || '')}${testPills(r.last_checks)}</td>
         <td class="small">${r.response_ms != null ? r.response_ms + ' ms' : '—'}</td>
         <td class="small">${fmt(r.next_update)}</td>
         <td class="small">${fmt(r.last_run)}</td>
@@ -221,12 +290,23 @@ async function load() {
 }
 function esc(s) { return (s||'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
+function testPills(checks) {
+  if (!checks || !checks.length) return '';
+  const pills = checks.map(c =>
+    `<span class="pill ${c.status}" title="${esc((c.label || c.key) + ': ' + (c.message || ''))}">${esc(SHORT_TEST[c.key] || c.key)}</span>`
+  ).join('');
+  return `<div class="check-pills" style="margin-top:4px">${pills}</div>`;
+}
+
 function openForm() {
   editingId = null;
   document.getElementById('formTitle').textContent = 'Add responder';
-  ['f_alias','f_cert','f_issuer','f_uri','f_kuma'].forEach(i => document.getElementById(i).value = '');
+  ['f_alias','f_cert','f_issuer','f_uri','f_kuma','f_resptime'].forEach(i => document.getElementById(i).value = '');
   document.getElementById('f_freq').value = 60;
   document.getElementById('f_enabled').checked = true;
+  document.getElementById('f_tests_inherit').checked = true;
+  renderTestChecks('f_tests_box', 'f_t_', globalDefaultTests);
+  document.getElementById('f_tests_box').classList.add('disabled');
   document.getElementById('formErrors').textContent = '';
   document.getElementById('formOverlay').classList.add('open');
 }
@@ -244,6 +324,11 @@ async function editRow(id) {
   document.getElementById('f_kuma').value = r.uptime_kuma_url || '';
   document.getElementById('f_freq').value = r.frequency_min;
   document.getElementById('f_enabled').checked = r.enabled;
+  document.getElementById('f_resptime').value = (r.response_time_ms == null ? '' : r.response_time_ms);
+  const inherit = (r.tests == null);
+  document.getElementById('f_tests_inherit').checked = inherit;
+  renderTestChecks('f_tests_box', 'f_t_', inherit ? globalDefaultTests : r.tests);
+  document.getElementById('f_tests_box').classList.toggle('disabled', inherit);
   document.getElementById('formErrors').textContent = '';
   document.getElementById('formOverlay').classList.add('open');
 }
@@ -257,6 +342,12 @@ async function saveForm() {
     uptime_kuma_url: document.getElementById('f_kuma').value,
     frequency_min: parseInt(document.getElementById('f_freq').value) || 60,
     enabled: document.getElementById('f_enabled').checked,
+    // null => inherit the global default set; an array => this responder's own set.
+    tests: document.getElementById('f_tests_inherit').checked
+      ? null : selectedTests('f_tests_box'),
+    // '' => inherit the global default threshold; a number => this responder's own.
+    response_time_ms: document.getElementById('f_resptime').value === ''
+      ? null : parseInt(document.getElementById('f_resptime').value),
   };
   const btn = document.getElementById('saveBtn');
   btn.disabled = true;
@@ -312,6 +403,9 @@ async function openSettings() {
   document.getElementById('s_debug').checked = !!s.debug_logging;
   document.getElementById('s_failures').checked = !!s.log_only_failures;
   document.getElementById('s_kuma').checked = !!s.uptime_kuma_logging;
+  globalDefaultTests = s.default_tests || [];
+  renderTestChecks('s_tests_box', 's_t_', globalDefaultTests);
+  document.getElementById('s_resptime').value = s.default_response_time_ms || '';
   document.getElementById('settingsOverlay').classList.add('open');
 }
 function closeSettings() { document.getElementById('settingsOverlay').classList.remove('open'); }
@@ -322,8 +416,11 @@ async function saveSettings() {
       debug_logging: document.getElementById('s_debug').checked,
       log_only_failures: document.getElementById('s_failures').checked,
       uptime_kuma_logging: document.getElementById('s_kuma').checked,
+      default_tests: selectedTests('s_tests_box'),
+      default_response_time_ms: parseInt(document.getElementById('s_resptime').value) || 2000,
     })
   });
+  globalDefaultTests = selectedTests('s_tests_box');
   closeSettings(); flash('Settings saved.');
 }
 
@@ -331,7 +428,14 @@ async function saveSettings() {
 document.querySelectorAll('.overlay').forEach(o =>
   o.addEventListener('click', e => { if (e.target === o) o.classList.remove('open'); }));
 
-load();
+async function init() {
+  await loadTests();
+  // Preload the global default so the Add form shows it before Settings is opened.
+  try { globalDefaultTests = (await (await fetch(API('/settings'))).json()).default_tests || []; }
+  catch (e) { globalDefaultTests = []; }
+  load();
+}
+init();
 setInterval(load, 15000);  // poll for live status
 </script>
 </body>

@@ -67,7 +67,16 @@ os.makedirs(DATA_DIR, exist_ok=True)
 # get HTTP 200, parse the DER, confirm responseStatus == successful) because
 # without them there is nothing to evaluate. Beyond that, these named tests can
 # be individually enabled per responder (or via a global default).
-TESTS = [
+FOUNDATIONAL_TESTS = [
+    ("cert_load",       "Certificate & issuer load"),
+    ("ocsp_uri",        "OCSP URI available"),
+    ("request_build",   "OCSP request builds"),
+    ("reachable",       "Responder reachable"),
+    ("http_200",        "HTTP 200 response"),
+    ("response_parse",  "Response parses (DER)"),
+    ("response_status", "OCSP responseStatus successful"),
+]
+EVAL_TESTS = [
     ("cert_status",   "Certificate status (GOOD / not revoked)"),
     ("cert_id_match", "CertID serial match (response is about this certificate)"),
     ("signature",     "Response signature verification"),
@@ -77,12 +86,26 @@ TESTS = [
     ("nonce",         "Nonce echo (response echoes the request nonce)"),
     ("response_time", "Response-time threshold (round-trip under the limit)"),
 ]
+# Foundational tests are prerequisites in a chain (each enables the next); when
+# one fails the check cannot continue and dependent tests are skipped. Whether
+# that failure marks the responder as an error depends on whether the test is
+# selected — deselect it and its failure is recorded but no longer fails the
+# status. They default ON, preserving the obvious behaviour. Evaluation tests
+# inspect a successfully parsed response.
+TESTS = FOUNDATIONAL_TESTS + EVAL_TESTS
 ALL_TEST_KEYS = [k for k, _ in TESTS]
 TEST_LABELS = dict(TESTS)
-# Default set for new installs. Excludes the two that can surprise people:
-# `nonce` (many responders don't support it) and `response_time` (depends on a
-# threshold). Both are opt-in.
-DEFAULT_TESTS = [
+FOUNDATIONAL_KEYS = [k for k, _ in FOUNDATIONAL_TESTS]
+
+
+def test_group(key):
+    return "foundational" if key in FOUNDATIONAL_KEYS else "evaluation"
+
+
+# Default set for new installs: every foundational step, plus the evaluation
+# tests except the two that can surprise people — `nonce` (many responders
+# don't support it) and `response_time` (depends on a threshold). Both opt-in.
+DEFAULT_TESTS = FOUNDATIONAL_KEYS + [
     "cert_status", "cert_id_match", "signature",
     "signing_cert_validity", "this_update", "next_update",
 ]
@@ -475,92 +498,143 @@ def _evaluate_tests(enabled, ocsp_resp, this_update, next_update, issuer, cert,
     return checks, cert_status
 
 
+def _derive_status(checks, cert_status_raw):
+    """Overall responder status from the per-test check dicts."""
+    failed = [c for c in checks if c["status"] == "fail"]
+    cert_check = next((c for c in checks if c["key"] == "cert_status"), None)
+    cert_failed = cert_check is not None and cert_check["status"] == "fail"
+    if cert_failed and cert_status_raw == x509_ocsp.OCSPCertStatus.REVOKED:
+        return "Revoked"
+    if cert_failed and cert_status_raw == x509_ocsp.OCSPCertStatus.UNKNOWN:
+        return "Unknown"
+    if failed:
+        return "Error"
+    return "Valid"
+
+
+def _compose_message(checks, enabled):
+    failed = [c for c in checks if c["status"] == "fail"]
+    skipped = [c for c in checks if c["status"] == "skip"]
+    if not enabled:
+        return "No verification tests selected."
+    if failed:
+        return (f"{len(failed)} of {len(enabled)} checks failed: "
+                + " ".join(c["message"] for c in failed))
+    if skipped:
+        # A deselected prerequisite step failed: nothing failed the status, but
+        # the dependent tests could not run.
+        passed = len(enabled) - len(skipped)
+        return (f"A prerequisite step was not met (and not selected); "
+                f"{len(skipped)} dependent check(s) skipped, {passed} passed.")
+    return f"All {len(enabled)} selected checks passed."
+
+
 def run_ocsp_check(cert_pem, issuer_pem, ocsp_uri, enabled_tests=None,
                    timeout=OCSP_TIMEOUT, threshold_ms=0):
     """Build a real OCSP request, POST it, parse the response, and evaluate the
     selected verification tests.
 
-    `enabled_tests` is a list of test keys (see ALL_TEST_KEYS). The foundational
-    steps — reach the responder, HTTP 200, parse DER, responseStatus == success —
-    always run; failing any of them is an Error regardless of selection.
-    `threshold_ms` is the response-time limit for the response_time test.
+    Every test — foundational and evaluation — is individually selectable via
+    `enabled_tests` (see ALL_TEST_KEYS). The foundational steps form a
+    dependency chain; when one fails the check cannot continue and the dependent
+    tests are skipped. A failed foundational step only fails the overall status
+    when that step is selected. `threshold_ms` is the response-time limit.
     """
     enabled = [k for k in ALL_TEST_KEYS if k in (enabled_tests or [])]
+    enabled_set = set(enabled)
+    checks = []
 
-    def _skipped(reason):
-        return [{"key": k, "label": TEST_LABELS[k], "status": "skip",
-                 "message": reason} for k in enabled]
+    def record(key, ok, message):
+        """Record a foundational step's outcome, but only if it's selected."""
+        if key in enabled_set:
+            checks.append({"key": key, "label": TEST_LABELS[key],
+                           "status": "pass" if ok else "fail", "message": message})
+
+    def finish(response_ms=None, this_update=None, next_update=None,
+               cert_status_raw=None):
+        # Any selected test we never reached couldn't run -> skip.
+        done = {c["key"] for c in checks}
+        for k in enabled:
+            if k not in done:
+                checks.append({"key": k, "label": TEST_LABELS[k], "status": "skip",
+                               "message": "Not evaluated (a prerequisite step did not pass)."})
+        order = {k: i for i, k in enumerate(ALL_TEST_KEYS)}
+        checks.sort(key=lambda c: order.get(c["key"], 999))
+        return OCSPResult(
+            _derive_status(checks, cert_status_raw),
+            _compose_message(checks, enabled),
+            response_ms=response_ms, this_update=this_update,
+            next_update=next_update, checks=checks,
+        )
 
     start = time.monotonic()
+
+    # 1. Load the certificate and issuer.
     try:
         cert = _load_cert(cert_pem, "Certificate")
         issuer = _load_cert(issuer_pem, "Issuer certificate")
     except Exception as e:
-        return OCSPResult("Error", f"Certificate load failed: {e}",
-                          checks=_skipped("Not evaluated (certificate load failed)."))
+        record("cert_load", False, f"Certificate load failed: {e}")
+        return finish()
+    record("cert_load", True, "Certificate and issuer loaded.")
 
-    # Fall back to the AIA OCSP URL embedded in the cert if none was given.
+    # 2. Resolve the OCSP URI (given, or from the cert's AIA extension).
     uri = (ocsp_uri or "").strip() or _ocsp_uri_from_cert(cert)
     if not uri:
-        return OCSPResult(
-            "Error",
-            "No OCSP URI provided and none found in the certificate's AIA extension.",
-            checks=_skipped("Not evaluated (no OCSP URI)."),
-        )
+        record("ocsp_uri", False,
+               "No OCSP URI provided and none found in the certificate's AIA extension.")
+        return finish()
+    record("ocsp_uri", True, "OCSP URI resolved.")
 
-    # Only attach a nonce when the nonce test is selected; some responders
-    # behave differently (or refuse to cache) when a nonce is present.
+    # 3. Build the request (attaching a nonce only when that test is selected).
     sent_nonce = None
     try:
         builder = OCSPRequestBuilder().add_certificate(cert, issuer, hashes.SHA1())
-        if "nonce" in enabled:
+        if "nonce" in enabled_set:
             sent_nonce = os.urandom(16)
             builder = builder.add_extension(x509.OCSPNonce(sent_nonce), critical=False)
         ocsp_req = builder.build()
         der = ocsp_req.public_bytes(serialization.Encoding.DER)
     except Exception as e:
-        return OCSPResult("Error", f"Failed to build OCSP request: {e}",
-                          checks=_skipped("Not evaluated (request build failed)."))
+        record("request_build", False, f"Failed to build OCSP request: {e}")
+        return finish()
+    record("request_build", True, "OCSP request built.")
 
+    # 4. POST to the responder.
     try:
         resp = requests.post(
-            uri,
-            data=der,
-            headers={
-                "Content-Type": "application/ocsp-request",
-                "Accept": "application/ocsp-response",
-            },
+            uri, data=der,
+            headers={"Content-Type": "application/ocsp-request",
+                     "Accept": "application/ocsp-response"},
             timeout=timeout,
         )
     except requests.exceptions.RequestException as e:
-        return OCSPResult("Error", f"OCSP responder unreachable: {e}",
-                          checks=_skipped("Not evaluated (responder unreachable)."))
+        record("reachable", False, f"OCSP responder unreachable: {e}")
+        return finish()
+    record("reachable", True, "Responder reachable.")
 
     elapsed_ms = int((time.monotonic() - start) * 1000)
 
+    # 5. HTTP 200.
     if resp.status_code != 200:
-        return OCSPResult(
-            "Error",
-            f"OCSP responder returned HTTP {resp.status_code}.",
-            response_ms=elapsed_ms,
-            checks=_skipped("Not evaluated (non-200 response)."),
-        )
+        record("http_200", False, f"OCSP responder returned HTTP {resp.status_code}.")
+        return finish(response_ms=elapsed_ms)
+    record("http_200", True, "Responder returned HTTP 200.")
 
+    # 6. Parse the DER response.
     try:
         ocsp_resp = load_der_ocsp_response(resp.content)
     except Exception as e:
-        return OCSPResult(
-            "Error", f"Failed to parse OCSP response: {e}", response_ms=elapsed_ms,
-            checks=_skipped("Not evaluated (unparseable response)."),
-        )
+        record("response_parse", False, f"Failed to parse OCSP response: {e}")
+        return finish(response_ms=elapsed_ms)
+    record("response_parse", True, "Response parsed as DER.")
 
+    # 7. responseStatus == successful (required before reading cert data).
     if ocsp_resp.response_status != x509_ocsp.OCSPResponseStatus.SUCCESSFUL:
-        return OCSPResult(
-            "Error",
-            f"OCSP response status: {ocsp_resp.response_status.name}.",
-            response_ms=elapsed_ms,
-            checks=_skipped("Not evaluated (responseStatus not successful)."),
-        )
+        record("response_status", False,
+               f"OCSP response status: {ocsp_resp.response_status.name}.")
+        return finish(response_ms=elapsed_ms)
+    record("response_status", True, "OCSP responseStatus is successful.")
 
     def _fmt(dt):
         return dt.isoformat() if dt else None
@@ -575,41 +649,14 @@ def run_ocsp_check(cert_pem, issuer_pem, ocsp_uri, enabled_tests=None,
     this_update = _aware(this_update)
     next_update = _aware(next_update)
 
-    checks, cert_status_raw = _evaluate_tests(
+    eval_checks, cert_status_raw = _evaluate_tests(
         enabled, ocsp_resp, this_update, next_update, issuer, cert,
         elapsed_ms=elapsed_ms, threshold_ms=threshold_ms, sent_nonce=sent_nonce,
     )
+    checks.extend(eval_checks)
 
-    # Derive the overall status from the enabled tests only.
-    failed = [c for c in checks if c["status"] == "fail"]
-    cert_check = next((c for c in checks if c["key"] == "cert_status"), None)
-    if cert_check and cert_check["status"] == "fail" and \
-            cert_status_raw == x509_ocsp.OCSPCertStatus.REVOKED:
-        status = "Revoked"
-    elif cert_check and cert_check["status"] == "fail" and \
-            cert_status_raw == x509_ocsp.OCSPCertStatus.UNKNOWN:
-        status = "Unknown"
-    elif failed:
-        status = "Error"
-    else:
-        status = "Valid"
-
-    if not enabled:
-        message = "Responder reachable; no verification tests selected."
-    elif failed:
-        message = f"{len(failed)} of {len(enabled)} checks failed: " + \
-            " ".join(c["message"] for c in failed)
-    else:
-        message = f"All {len(enabled)} selected checks passed."
-
-    return OCSPResult(
-        status,
-        message,
-        response_ms=elapsed_ms,
-        this_update=_fmt(this_update),
-        next_update=_fmt(next_update),
-        checks=checks,
-    )
+    return finish(response_ms=elapsed_ms, this_update=_fmt(this_update),
+                  next_update=_fmt(next_update), cert_status_raw=cert_status_raw)
 
 
 # --------------------------------------------------------------------------- #
@@ -1002,8 +1049,9 @@ def responder_history(rid):
 # ---- Tests registry ---- #
 @app.route("/api/tests", methods=["GET"])
 def list_tests():
-    """The catalogue of selectable verification tests (key + human label)."""
-    return jsonify([{"key": k, "label": v} for k, v in TESTS])
+    """The catalogue of selectable verification tests (key, label, group)."""
+    return jsonify([{"key": k, "label": v, "group": test_group(k)}
+                    for k, v in TESTS])
 
 
 # ---- Settings ---- #

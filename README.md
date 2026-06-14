@@ -137,12 +137,29 @@ No `openssl` CLI is invoked — it's all in-process via `cryptography`.
 
 ## Selectable verification tests
 
-The foundational steps — reach the responder, get HTTP 200, parse the DER, and
-confirm `responseStatus == successful` — always run, because without them there
-is nothing to evaluate. Beyond that, you choose which **tests** decide a
-responder's status:
+Every step of a check is an individually selectable **test**, in two groups.
 
-| Test | What it checks |
+**Foundational tests** form a dependency chain — each one is a prerequisite for
+the next. When one fails the check can't continue, so the dependent tests are
+skipped. They're all on by default; deselecting one means its failure is still
+recorded but no longer flips the responder to an error (use this only if you
+deliberately don't want to alert on, say, an unreachable responder — note that
+deselecting a foundational step can let a responder report `Valid` without
+actually verifying anything).
+
+| Foundational test | What it checks |
+|---|---|
+| **Certificate & issuer load** | Both PEMs parse into valid X.509 certificates. |
+| **OCSP URI available** | A URI was supplied or found in the cert's AIA extension. |
+| **OCSP request builds** | A well-formed OCSP request can be constructed. |
+| **Responder reachable** | The HTTP POST to the responder succeeds. |
+| **HTTP 200 response** | The responder returns status code 200. |
+| **Response parses (DER)** | The body decodes as a DER OCSP response. |
+| **responseStatus successful** | The OCSP-layer status is `successful` (not `tryLater`, `internalError`, …). |
+
+**Evaluation tests** inspect a successfully parsed response:
+
+| Evaluation test | What it checks |
 |---|---|
 | **Certificate status** | The certificate is `GOOD` — not `REVOKED` or `UNKNOWN`. |
 | **CertID serial match** | The response's `CertID` serial number matches the certificate you asked about (guards against mismatched/substituted responses). |

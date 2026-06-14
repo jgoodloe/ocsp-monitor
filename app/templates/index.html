@@ -86,6 +86,9 @@
   .tests-box.disabled { opacity: .45; pointer-events: none; }
   .tests-box .check { margin: 0; }
   .tests-box label { margin: 0; color: var(--text); }
+  .tests-group-head { font-size: 11px; font-weight: 700; color: var(--muted);
+    text-transform: uppercase; letter-spacing: .03em; margin: 6px 0 2px; }
+  .tests-group-head:first-child { margin-top: 0; }
   .check-pills { display: flex; flex-wrap: wrap; gap: 4px; }
   .pill { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px;
     font-weight: 600; border: 1px solid var(--border); }
@@ -218,6 +221,9 @@ let globalDefaultTests = [];       // current global default set
 
 // Short labels for the compact result pills in the table.
 const SHORT_TEST = {
+  cert_load: 'load', ocsp_uri: 'uri', request_build: 'build',
+  reachable: 'reachable', http_200: 'http200', response_parse: 'parse',
+  response_status: 'respStatus',
   cert_status: 'status', cert_id_match: 'certID', signature: 'signature',
   signing_cert_validity: 'signerValid', this_update: 'thisUpdate',
   next_update: 'nextUpdate', nonce: 'nonce', response_time: 'respTime',
@@ -230,11 +236,22 @@ async function loadTests() {
 
 function renderTestChecks(boxId, prefix, selected) {
   selected = selected || [];
-  document.getElementById(boxId).innerHTML = AVAILABLE_TESTS.map(t => `
-    <div class="check">
-      <input type="checkbox" id="${prefix}${t.key}" value="${t.key}" ${selected.includes(t.key) ? 'checked' : ''}>
-      <label for="${prefix}${t.key}">${esc(t.label)}</label>
-    </div>`).join('');
+  const groups = [
+    ['foundational', 'Foundational — connect & parse (failing one skips the rest)'],
+    ['evaluation', 'Evaluation — inspect the response'],
+  ];
+  let html = '';
+  for (const [g, heading] of groups) {
+    const items = AVAILABLE_TESTS.filter(t => (t.group || 'evaluation') === g);
+    if (!items.length) continue;
+    html += `<div class="tests-group-head">${heading}</div>`;
+    html += items.map(t => `
+      <div class="check">
+        <input type="checkbox" id="${prefix}${t.key}" value="${t.key}" ${selected.includes(t.key) ? 'checked' : ''}>
+        <label for="${prefix}${t.key}">${esc(t.label)}</label>
+      </div>`).join('');
+  }
+  document.getElementById(boxId).innerHTML = html;
 }
 
 function selectedTests(boxId) {

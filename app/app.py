@@ -1062,7 +1062,12 @@ def responder_to_dict(row, include_pem=True):
 # ---- UI ---- #
 @app.route("/")
 def index():
-    return render_template("index.html")
+    # The single-page shell carries the JS that talks to the API, so never let
+    # a browser serve a stale copy against a newer backend (e.g. a cached page
+    # that predates the X-Requested-With requirement).
+    resp = app.make_response(render_template("index.html"))
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    return resp
 
 
 # ---- Health ---- #

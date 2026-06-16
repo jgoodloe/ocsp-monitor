@@ -409,6 +409,7 @@ async function load() {
           <button class="secondary tiny" onclick="toggleEnabled(${r.id}, ${r.enabled ? 'true' : 'false'})">${r.enabled ? 'Disable' : 'Enable'}</button>
           <button class="secondary tiny" onclick="showHist(${r.id})">History</button>
           <button class="secondary tiny" onclick="editRow(${r.id})">Edit</button>
+          <button class="secondary tiny" onclick="cloneRow(${r.id})">Clone</button>
           <button class="danger tiny" onclick="delRow(${r.id})">Del</button>
         </div></td>`;
       rows.appendChild(tr);
@@ -440,22 +441,17 @@ function openForm() {
 }
 function closeForm() { document.getElementById('formOverlay').classList.remove('open'); }
 
-async function editRow(id) {
-  const res = await fetch(API('/responders/' + id));
-  const r = await res.json();
-  editingId = id;
-  document.getElementById('formTitle').textContent = 'Edit responder';
-  document.getElementById('f_alias').value = r.cert_alias;
+// Fill the add/edit form from a responder record (used by both Edit and Clone).
+function populateForm(r) {
+  document.getElementById('f_alias').value = r.cert_alias || '';
   document.getElementById('f_cert').value = r.cert_pem || '';
   document.getElementById('f_issuer').value = r.issuer_pem || '';
   document.getElementById('f_uri').value = r.ocsp_uri || '';
-  // The push URL is a secret and is never returned; the field stays blank.
-  // Leaving it blank keeps the stored value; typing a new one replaces it.
+  // The detail view returns the real push URL so it can be verified/edited
+  // directly. Saving stores exactly what's in the box (blank clears it).
   const kuma = document.getElementById('f_kuma');
-  kuma.value = '';
-  kuma.placeholder = r.uptime_kuma_url_set
-    ? 'A push URL is set — leave blank to keep it, or enter a new one'
-    : 'https://status.example.com/api/push/TOKEN';
+  kuma.value = r.uptime_kuma_url || '';
+  kuma.placeholder = 'https://status.example.com/api/push/TOKEN';
   document.getElementById('f_freq').value = r.frequency_min;
   document.getElementById('f_enabled').checked = r.enabled;
   document.getElementById('f_resptime').value = (r.response_time_ms == null ? '' : r.response_time_ms);
@@ -465,6 +461,24 @@ async function editRow(id) {
   document.getElementById('f_tests_box').classList.toggle('disabled', inherit);
   document.getElementById('formErrors').textContent = '';
   document.getElementById('formOverlay').classList.add('open');
+}
+
+async function editRow(id) {
+  const res = await fetch(API('/responders/' + id));
+  const r = await res.json();
+  editingId = id;
+  document.getElementById('formTitle').textContent = 'Edit responder';
+  populateForm(r);
+}
+
+// Open the form pre-filled from an existing responder as a brand-new copy.
+async function cloneRow(id) {
+  const res = await fetch(API('/responders/' + id));
+  const r = await res.json();
+  editingId = null;            // null => saveForm POSTs a new responder
+  document.getElementById('formTitle').textContent = 'Clone responder';
+  r.cert_alias = (r.cert_alias || '') + ' (copy)';
+  populateForm(r);
 }
 
 async function saveForm() {

@@ -65,7 +65,9 @@ Open <http://localhost:8080>. Click **+ Add responder** and provide:
 - **Frequency**, **Uptime Kuma URL**, **Enabled** — as needed.
 
 The first check runs immediately; subsequent checks run on the schedule. Use
-**Check** on any row to run an on-demand check.
+**Check** on any row to run an on-demand check, or **Clone** to open the form
+pre-filled from an existing responder as a new copy (handy for monitoring
+several certs from the same CA).
 
 ## Configuration (environment variables)
 
@@ -106,9 +108,12 @@ blast radius but does not replace access control.
   a JSON content type, which browsers can't send cross-origin without a CORS
   preflight the app never grants. Set `SameSite` on any session cookie you add.
 - **Secrets.** The Uptime Kuma push URL embeds a token. It is stored in SQLite
-  and **never returned by the API** (only a mask is shown) nor logged. Treat the
-  data volume as secret-bearing and protect it. Editing a responder leaves the
-  push-URL field blank to keep the existing value; type a new URL to replace it.
+  and never logged. The bulk list endpoint returns it **masked**, but the
+  single-responder detail view (used by the edit/clone form) returns it in full
+  so the operator can verify it — anyone who can reach that endpoint sees the
+  token, so keep the app behind your reverse proxy. Treat the data volume as
+  secret-bearing and protect it. On edit, the push-URL field is authoritative:
+  it is saved exactly as shown (blank clears it).
 - **Error messages.** Network/parse errors are returned to clients as generic,
   category-level messages (full detail is logged server-side) so they can't be
   used as an SSRF reconnaissance oracle.
@@ -322,9 +327,11 @@ default set", and an array of test keys (e.g. `["cert_status","signature"]`)
 pins that responder's own selection. A `response_time_ms` field (or `null` to
 inherit the global default) sets the limit for the response-time test. The most
 recent per-test outcomes are returned in `last_checks`. The `uptime_kuma_url`
-field is returned **masked** (the secret token is never exposed); a boolean
-`uptime_kuma_url_set` indicates whether one is configured. On update, send a new
-URL to replace it or omit/blank it to keep the stored value.
+field is returned in full by the single-responder `GET /api/responders/<id>`
+(so it can be verified or cloned) and **masked** in the `GET /api/responders`
+list; a boolean `uptime_kuma_url_set` indicates whether one is configured. On
+update, an included `uptime_kuma_url` is saved verbatim (blank clears it); omit
+the key to keep the stored value.
 
 State-changing requests (`POST`/`PUT`/`DELETE`) must include an
 `X-Requested-With` header and a JSON body, and are rate-limited per client IP.

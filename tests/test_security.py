@@ -182,3 +182,45 @@ def test_mutation_requires_csrf_header(m):
     client = m.app.test_client()
     r = client.post("/api/responders", json={"cert_alias": "x"})
     assert r.status_code == 403
+
+
+# --------------------------------------------------------------------------- #
+# Push URL: real value in the detail view (verifiable/clonable), masked in list
+# --------------------------------------------------------------------------- #
+def _csrf():
+    return {"X-Requested-With": "XMLHttpRequest"}
+
+
+def _make_responder(client, **extra):
+    pem = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----"
+    payload = {"cert_alias": "kuma-test", "cert_pem": pem, "issuer_pem": pem}
+    payload.update(extra)
+    r = client.post("/api/responders", json=payload, headers=_csrf())
+    assert r.status_code == 201, r.get_data(as_text=True)
+    return r.get_json()["id"]
+
+
+def test_push_url_visible_in_detail_masked_in_list(m):
+    client = m.app.test_client()
+    url = "https://status.example.com/api/push/SECRETTOKEN"
+    rid = _make_responder(client, uptime_kuma_url=url)
+
+    detail = client.get(f"/api/responders/{rid}").get_json()
+    assert detail["uptime_kuma_url"] == url  # verbatim, for verify/clone
+
+    listed = next(x for x in client.get("/api/responders").get_json() if x["id"] == rid)
+    assert "SECRETTOKEN" not in listed["uptime_kuma_url"]  # masked in bulk list
+
+
+def test_update_push_url_is_authoritative(m):
+    client = m.app.test_client()
+    url = "https://status.example.com/api/push/TOK1"
+    rid = _make_responder(client, uptime_kuma_url=url)
+
+    # Omitting the key keeps the stored value.
+    client.put(f"/api/responders/{rid}", json={"frequency_min": 30}, headers=_csrf())
+    assert client.get(f"/api/responders/{rid}").get_json()["uptime_kuma_url"] == url
+
+    # An explicit empty value clears it (what you see is what's saved).
+    client.put(f"/api/responders/{rid}", json={"uptime_kuma_url": ""}, headers=_csrf())
+    assert client.get(f"/api/responders/{rid}").get_json()["uptime_kuma_url"] == ""

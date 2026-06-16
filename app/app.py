@@ -1349,10 +1349,12 @@ def responder_to_dict(row, include_pem=True):
         "ocsp_uri": row["ocsp_uri"],
         "frequency_min": row["frequency_min"],
         "enabled": bool(row["enabled"]),
-        # The push URL embeds a secret token, so never return it verbatim.
-        # The UI shows the mask and re-saves only when the operator types a new
-        # value (a blank field keeps the stored URL — see update_responder).
-        "uptime_kuma_url": _mask_secret_url(row["uptime_kuma_url"]),
+        # The push URL embeds a secret token. The single-responder detail view
+        # (include_pem=True), used by the edit/clone form, returns it verbatim
+        # so the operator can verify and clone it; the bulk list stays masked to
+        # avoid spraying every token across one response.
+        "uptime_kuma_url": (row["uptime_kuma_url"] if include_pem
+                            else _mask_secret_url(row["uptime_kuma_url"])),
         "uptime_kuma_url_set": bool((row["uptime_kuma_url"] or "").strip()),
         # None means "inherit the global default set".
         "tests": parse_tests(row["tests"] if "tests" in row.keys() else None),
@@ -1514,12 +1516,12 @@ def update_responder(rid):
         "ocsp_uri": (data.get("ocsp_uri", row["ocsp_uri"]) or "").strip(),
         "frequency_min": int(data.get("frequency_min", row["frequency_min"])),
         "enabled": 1 if data.get("enabled", bool(row["enabled"])) else 0,
-        # Keep the stored push URL unless a new, non-blank value is supplied
-        # (the API only ever returns a mask, so a blank field means "unchanged").
+        # The detail view returns the real push URL, so the form field is
+        # authoritative: save exactly what it holds (empty clears it). Only an
+        # omitted key leaves the stored value untouched.
         "uptime_kuma_url": (
-            data["uptime_kuma_url"].strip()
-            if "uptime_kuma_url" in data and (data.get("uptime_kuma_url") or "").strip()
-            else row["uptime_kuma_url"]
+            (data.get("uptime_kuma_url") or "").strip()
+            if "uptime_kuma_url" in data else row["uptime_kuma_url"]
         ),
         # Only touch the test selection if the client sent it.
         "tests": _tests_to_db(data["tests"]) if "tests" in data else row["tests"],

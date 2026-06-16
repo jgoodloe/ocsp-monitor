@@ -341,7 +341,9 @@ def validate_outbound_url(url):
     reached from the server: loopback, link-local (incl. 169.254 cloud
     metadata), multicast, reserved and unspecified are always blocked; private
     / unique-local are blocked when OCSP_BLOCK_PRIVATE is set, unless the host
-    is explicitly allowlisted. Returns the parsed host. Raises UnsafeURLError.
+    is explicitly allowlisted. Returns (hostname, pinned_ip) — the caller must
+    connect to pinned_ip so the host cannot re-resolve to a blocked address
+    after this check (DNS rebinding). Raises UnsafeURLError.
     """
     if not url or not url.strip():
         raise UnsafeURLError("empty URL")
@@ -359,6 +361,7 @@ def validate_outbound_url(url):
         raise UnsafeURLError(f"hostname does not resolve: {e}")
 
     seen = set()
+    validated = []
     for info in infos:
         addr = info[4][0].split("%")[0]  # strip any IPv6 zone id
         if addr in seen:
@@ -372,7 +375,61 @@ def validate_outbound_url(url):
                 raise UnsafeURLError(f"destination {addr} is not permitted")
         elif ip.is_private and OCSP_BLOCK_PRIVATE and not allowed:
             raise UnsafeURLError(f"destination {addr} is in a private range")
-    return hostname
+        validated.append(addr)
+    if not validated:
+        raise UnsafeURLError("hostname does not resolve to any address")
+    # Pin to an address we just validated. The caller dials this IP directly so
+    # a hostile resolver can't swap in a blocked address between now and the
+    # request (DNS rebinding).
+    return hostname, validated[0]
+
+
+# --------------------------------------------------------------------------- #
+# Outbound fetch pinned to a pre-validated IP (DNS-rebinding safe)
+# --------------------------------------------------------------------------- #
+class _PinnedIPAdapter(requests.adapters.HTTPAdapter):
+    """Connect only to the IP that validate_outbound_url() already vetted.
+
+    The request URL's host is rewritten to the pinned IP so no second DNS
+    lookup happens, while the original Host header (and, for TLS, the SNI /
+    certificate hostname) is preserved so virtual hosting and cert verification
+    still behave normally.
+    """
+
+    def __init__(self, hostname, pinned_ip, is_https, **kwargs):
+        self._hostname = hostname
+        self._pinned_ip = pinned_ip
+        self._is_https = is_https
+        super().__init__(**kwargs)
+
+    def init_poolmanager(self, *args, **kwargs):
+        if self._is_https:
+            # Verify the cert against, and send SNI for, the real hostname even
+            # though the socket connects to the pinned IP. (These pool kwargs
+            # are only valid for HTTPS pools, hence the scheme guard.)
+            kwargs["assert_hostname"] = self._hostname
+            kwargs["server_hostname"] = self._hostname
+        super().init_poolmanager(*args, **kwargs)
+
+    def send(self, request, **kwargs):
+        parts = urlsplit(request.url)
+        if (parts.hostname or "").lower() == self._hostname.lower():
+            host_header = parts.netloc  # original host[:port], for the Host hdr
+            netloc = f"[{self._pinned_ip}]" if ":" in self._pinned_ip else self._pinned_ip
+            if parts.port:
+                netloc = f"{netloc}:{parts.port}"
+            request.url = parts._replace(netloc=netloc).geturl()
+            request.headers["Host"] = host_header
+        return super().send(request, **kwargs)
+
+
+def _pinned_request(method, url, hostname, pinned_ip, **kwargs):
+    """Issue a request that connects only to `pinned_ip` for `hostname`."""
+    scheme = urlsplit(url).scheme.lower()
+    adapter = _PinnedIPAdapter(hostname, pinned_ip, scheme == "https")
+    with requests.Session() as session:
+        session.mount(f"{scheme}://", adapter)
+        return session.request(method, url, **kwargs)
 
 
 # --------------------------------------------------------------------------- #
@@ -723,7 +780,7 @@ def run_ocsp_check(cert_pem, issuer_pem, ocsp_uri, enabled_tests=None,
                "No OCSP URI provided and none found in the certificate's AIA extension.")
         return finish()
     try:
-        validate_outbound_url(uri)
+        pin_host, pin_ip = validate_outbound_url(uri)
     except UnsafeURLError as e:
         log.warning("[OCSP] blocked outbound URI %r: %s", uri, e)
         record("ocsp_uri", False,
@@ -749,8 +806,8 @@ def run_ocsp_check(cert_pem, issuer_pem, ocsp_uri, enabled_tests=None,
     # 4. POST to the responder. Redirects are disabled so a responder can't
     #    bounce us to an internal address that bypassed validation.
     try:
-        resp = requests.post(
-            uri, data=der,
+        resp = _pinned_request(
+            "POST", uri, pin_host, pin_ip, data=der,
             headers={"Content-Type": "application/ocsp-request",
                      "Accept": "application/ocsp-response"},
             timeout=timeout,
@@ -820,7 +877,7 @@ def push_to_uptime_kuma(url, status, message, logging_enabled=True):
     # The push URL carries a secret token and is attacker-influenceable, so it
     # is subject to the same egress policy and is never logged in full.
     try:
-        validate_outbound_url(url)
+        pin_host, pin_ip = validate_outbound_url(url)
     except UnsafeURLError as e:
         log.warning("[UptimeKuma] push URL blocked by egress policy: %s", e)
         return
@@ -828,8 +885,8 @@ def push_to_uptime_kuma(url, status, message, logging_enabled=True):
     try:
         if logging_enabled:
             log.info("[UptimeKuma] push status=%s msg=%s", kuma_status, message)
-        requests.get(
-            url,
+        _pinned_request(
+            "GET", url, pin_host, pin_ip,
             params={"status": kuma_status, "msg": message, "ping": ""},
             timeout=5,
             allow_redirects=False,

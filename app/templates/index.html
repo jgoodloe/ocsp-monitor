@@ -317,6 +317,15 @@ function mutate(url, method, body) {
 let editingId = null;
 let AVAILABLE_TESTS = [];          // [{key,label}] from /api/tests
 let globalDefaultTests = [];       // current global default set
+let RESPONDERS = [];               // last-loaded responder rows, by reference
+
+// Look up an alias by id rather than threading attacker-controlled text through
+// inline event-handler attributes (where HTML-entity decoding would undo the
+// escaping and allow script injection).
+function aliasFor(id) {
+  const r = RESPONDERS.find(x => x.id === id);
+  return r ? r.cert_alias : '';
+}
 
 // Short labels for the compact result pills in the table.
 const SHORT_TEST = {
@@ -380,6 +389,7 @@ async function load() {
   try {
     const res = await fetch(API('/responders'));
     const data = await res.json();
+    RESPONDERS = data;
     const rows = document.getElementById('rows');
     document.getElementById('empty').style.display = data.length ? 'none' : 'block';
     document.getElementById('table').style.display = data.length ? 'table' : 'none';
@@ -397,9 +407,9 @@ async function load() {
         <td><div class="actions">
           <button class="secondary tiny" onclick="checkNow(${r.id})">Check</button>
           <button class="secondary tiny" onclick="toggleEnabled(${r.id}, ${r.enabled ? 'true' : 'false'})">${r.enabled ? 'Disable' : 'Enable'}</button>
-          <button class="secondary tiny" onclick="showHist(${r.id}, '${esc(r.cert_alias)}')">History</button>
+          <button class="secondary tiny" onclick="showHist(${r.id})">History</button>
           <button class="secondary tiny" onclick="editRow(${r.id})">Edit</button>
-          <button class="danger tiny" onclick="delRow(${r.id}, '${esc(r.cert_alias)}')">Del</button>
+          <button class="danger tiny" onclick="delRow(${r.id})">Del</button>
         </div></td>`;
       rows.appendChild(tr);
     }
@@ -491,7 +501,8 @@ async function saveForm() {
   } finally { btn.disabled = false; }
 }
 
-async function delRow(id, alias) {
+async function delRow(id) {
+  const alias = aliasFor(id);
   if (!confirm('Delete "' + alias + '"?')) return;
   const res = await mutate(API('/responders/' + id), 'DELETE');
   flash(res.ok ? 'Deleted.' : 'Delete failed.'); load();
@@ -513,7 +524,8 @@ async function toggleEnabled(id, currentlyEnabled) {
   load();
 }
 
-async function showHist(id, alias) {
+async function showHist(id) {
+  const alias = aliasFor(id);
   document.getElementById('histTitle').textContent = 'History — ' + alias;
   const body = document.getElementById('histBody');
   body.innerHTML = '<span class="muted">Loading…</span>';

@@ -20,6 +20,8 @@ python3 -m venv .venv
 
 python -m pip install --quiet --upgrade pip
 python -m pip install --quiet -r requirements.txt
+# Test/dev tooling, when present.
+[ -f requirements-dev.txt ] && python -m pip install --quiet -r requirements-dev.txt
 
 # Persist the venv for the rest of the session.
 {

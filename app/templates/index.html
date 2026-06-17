@@ -668,8 +668,13 @@ async function runReport() {
 }
 
 function downtimeRow(d, showMonitor) {
-  const tag = d.excluded ? ' <span class="excluded-tag">(maintenance/disabled — excluded)</span>' : '';
+  const tag = d.manually_excluded
+    ? ' <span class="excluded-tag">(excluded by operator)</span>'
+    : (d.excluded ? ' <span class="excluded-tag">(maintenance/disabled — excluded)</span>' : '');
   const mon = showMonitor ? `<b>${esc(d.cert_alias)}</b> · ` : '';
+  const exclBtn = d.manually_excluded
+    ? `<button class="secondary tiny" onclick="toggleExclude(${d.hist_id}, false)">Re-include</button>`
+    : `<button class="secondary tiny" onclick="toggleExclude(${d.hist_id}, true)">Exclude</button>`;
   return `<div class="dt-row">
     <span class="small">${fmt(d.start)}</span>
     <span class="small">${fmtDur(d.duration_s)}</span>
@@ -677,6 +682,7 @@ function downtimeRow(d, showMonitor) {
       <div class="dt-comment">
         <input type="text" id="cmt_${d.hist_id}" placeholder="Add a comment…" value="${esc(d.comment || '')}">
         <button class="secondary tiny" onclick="saveComment(${d.hist_id})">Save</button>
+        ${exclBtn}
       </div>
     </span></div>`;
 }
@@ -694,7 +700,7 @@ function renderUptime(data) {
     return `<div class="uptime-card">
       <div class="uptime-head"><b>${esc(r.cert_alias)}</b><span class="uptime-pct">${pct}</span></div>
       <div class="bar"><span style="width:${w}%"></span></div>
-      <div class="muted small">up ${fmtDur(r.up_seconds)} · down ${fmtDur(r.down_seconds)} · maintenance ${fmtDur(r.maintenance_seconds)} · disabled ${fmtDur(r.disabled_seconds)} · no-data ${fmtDur(r.nodata_seconds)}</div>
+      <div class="muted small">up ${fmtDur(r.up_seconds)} · down ${fmtDur(r.down_seconds)} · maintenance ${fmtDur(r.maintenance_seconds)} · disabled ${fmtDur(r.disabled_seconds)} · excluded ${fmtDur(r.manual_excluded_seconds)} · no-data ${fmtDur(r.nodata_seconds)}</div>
       ${dts}</div>`;
   }).join('');
 }
@@ -710,6 +716,15 @@ async function saveComment(hid) {
   const val = document.getElementById('cmt_' + hid).value;
   const res = await mutate(API('/history/' + hid), 'PUT', { comment: val });
   flash(res.ok ? 'Comment saved.' : 'Save failed.');
+}
+
+// Exclude/re-include a single downtime event from uptime reports. The choice is
+// persisted on the history row, so it survives closing and reopening Reports.
+// Re-run the report so totals and the uptime % update immediately.
+async function toggleExclude(hid, excluded) {
+  const res = await mutate(API('/history/' + hid), 'PUT', { excluded });
+  if (res.ok) { flash(excluded ? 'Event excluded.' : 'Event re-included.'); runReport(); }
+  else { flash('Update failed.'); }
 }
 
 async function renderMaint() {

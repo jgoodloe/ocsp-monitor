@@ -21,8 +21,9 @@ import threading
 import time
 import logging
 from contextlib import closing
+import re
 from datetime import datetime, timezone, timedelta
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 import requests
 from flask import (
@@ -205,6 +206,9 @@ CREATE TABLE IF NOT EXISTS history (
     message      TEXT NOT NULL DEFAULT '',
     timestamp    TEXT NOT NULL,
     comment      TEXT,
+    -- Operator-toggled exclusion of this status-change event from uptime
+    -- reports (persists across report open/close).
+    excluded     INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (responder_id) REFERENCES responders(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_history_responder
@@ -289,6 +293,8 @@ def init_db():
         }
         if "comment" not in hist_cols:
             db.execute("ALTER TABLE history ADD COLUMN comment TEXT")
+        if "excluded" not in hist_cols:
+            db.execute("ALTER TABLE history ADD COLUMN excluded INTEGER NOT NULL DEFAULT 0")
         for k, v in DEFAULT_SETTINGS.items():
             db.execute(
                 "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
@@ -872,7 +878,11 @@ def run_ocsp_check(cert_pem, issuer_pem, ocsp_uri, enabled_tests=None,
 # Uptime Kuma passive push
 # --------------------------------------------------------------------------- #
 def push_to_uptime_kuma(url, status, message, logging_enabled=True):
-    if not url or not url.strip():
+    # Canonicalize at send time too, so even rows stored before normalization
+    # (or hand-edited in the DB) push to the right endpoint without conflicting
+    # status/msg/ping params.
+    url = normalize_kuma_url(url)
+    if not url:
         return
     # The push URL carries a secret token and is attacker-influenceable, so it
     # is subject to the same egress policy and is never logged in full.
@@ -966,12 +976,14 @@ def check_responder(db, row):
             "VALUES (?, ?, ?, ?)",
             (rid, result.status, result.message, now.isoformat()),
         )
-        # Trim history to HISTORY_LIMIT rows per responder, but never drop a
-        # row that carries an operator comment (it's referenced by reports).
+        # Trim history to HISTORY_LIMIT rows per responder, but never drop a row
+        # that carries an operator comment or a manual exclusion (both are
+        # referenced by reports).
         db.execute(
             """DELETE FROM history
                 WHERE responder_id=?
                   AND (comment IS NULL OR comment='')
+                  AND (excluded IS NULL OR excluded=0)
                   AND id NOT IN (
                       SELECT id FROM history WHERE responder_id=?
                       ORDER BY timestamp DESC LIMIT ?
@@ -1153,7 +1165,7 @@ def _maintenance_intervals(db, rid, win_start, win_end):
 def _status_segments(db, rid, win_start, win_end):
     """List of (start, end, row) over the window; row is None for no-data gaps."""
     rows = db.execute(
-        "SELECT id, status, message, timestamp, comment FROM history "
+        "SELECT id, status, message, timestamp, comment, excluded FROM history "
         "WHERE responder_id=? ORDER BY timestamp",
         (rid,),
     ).fetchall()
@@ -1187,7 +1199,7 @@ def _is_up(status, down_mode):
 def compute_uptime(db, rid, win_start, win_end, down_mode="not_valid",
                    exclude_maintenance=True, disabled_mode="exclude"):
     """Time-weighted uptime over [win_start, win_end] for one responder."""
-    up, down, nodata, downtimes = [], [], [], []
+    up, down, nodata, downtimes, manual = [], [], [], [], []
     for s, e, row in _status_segments(db, rid, win_start, win_end):
         if row is None:
             nodata.append((s, e))
@@ -1196,9 +1208,15 @@ def compute_uptime(db, rid, win_start, win_end, down_mode="not_valid",
             up.append((s, e))
         else:
             down.append((s, e))
+            # Operator-toggled exclusion of this specific downtime event
+            # (persisted on the history row), independent of maintenance.
+            excl = "excluded" in row.keys() and bool(row["excluded"])
+            if excl:
+                manual.append((s, e))
             downtimes.append({
                 "hist_id": row["id"], "status": row["status"],
                 "reason": row["message"], "comment": row["comment"],
+                "manually_excluded": excl,
                 "_start": s, "_end": e,
             })
 
@@ -1220,12 +1238,17 @@ def compute_uptime(db, rid, win_start, win_end, down_mode="not_valid",
         disabled_excluded = _subtract(disabled_excluded, maint)
         nodata = _subtract(nodata, maint)
 
+    # Manually excluded downtimes leave the totals entirely (like maintenance).
+    manual = _merge(manual)
+    if manual:
+        up, down = _subtract(up, manual), _subtract(down, manual)
+
     up_s, down_s = _dur(up), _dur(down)
     denom = up_s + down_s
     uptime_pct = round(100.0 * up_s / denom, 4) if denom > 0 else None
 
-    # Flag downtimes fully inside excluded (maintenance / disabled) time.
-    flag_excl = _merge(maint + (disabled if disabled_mode == "exclude" else []))
+    # Flag downtimes fully inside excluded (maintenance / disabled / manual) time.
+    flag_excl = _merge(maint + (disabled if disabled_mode == "exclude" else []) + manual)
     for d in downtimes:
         visible = _subtract([(d["_start"], d["_end"])], flag_excl)
         d["excluded"] = _dur(visible) == 0
@@ -1238,6 +1261,7 @@ def compute_uptime(db, rid, win_start, win_end, down_mode="not_valid",
         "down_seconds": down_s,
         "maintenance_seconds": _dur(maint),
         "disabled_seconds": _dur(disabled_excluded) if disabled_mode == "exclude" else 0.0,
+        "manual_excluded_seconds": _dur(manual),
         "nodata_seconds": _dur(nodata),
         "downtimes": downtimes,
     }
@@ -1329,6 +1353,36 @@ def _mask_secret_url(url):
     except ValueError:
         pass
     return "••••"
+
+
+# Query params the app sets itself on every Uptime Kuma push; any copies pasted
+# into the stored URL are dropped so they can't duplicate or override our values.
+_KUMA_OWNED_PARAMS = {"status", "msg", "ping"}
+
+
+def normalize_kuma_url(url):
+    """Canonicalize an Uptime Kuma push URL so it works however it was pasted.
+
+    Collapses runs of slashes in the path (Uptime Kuma sometimes emits
+    `//api/push/...`, which can otherwise 404) and drops any `status` / `msg` /
+    `ping` query params (the app sets those itself — a stray `status=up` could
+    otherwise win over the real result), preserving all other query params and
+    their order. A blank/whitespace value normalizes to "". Anything that
+    doesn't parse as a normal http(s) URL is returned stripped but unchanged.
+    """
+    url = (url or "").strip()
+    if not url:
+        return ""
+    try:
+        p = urlsplit(url)
+    except ValueError:
+        return url
+    if not p.scheme or not p.netloc:
+        return url
+    path = re.sub(r"/{2,}", "/", p.path)
+    kept = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
+            if k.lower() not in _KUMA_OWNED_PARAMS]
+    return urlunsplit((p.scheme, p.netloc, path, urlencode(kept), p.fragment))
 
 
 def _load_checks(value):
@@ -1500,7 +1554,7 @@ def create_responder():
             (data.get("ocsp_uri") or "").strip(),
             int(data.get("frequency_min", 60)),
             1 if data.get("enabled", True) else 0,
-            (data.get("uptime_kuma_url") or "").strip(),
+            normalize_kuma_url(data.get("uptime_kuma_url")),
             _tests_to_db(data.get("tests")),
             _int_or_none(data.get("response_time_ms")),
             now,  # schedule an immediate first run
@@ -1536,11 +1590,11 @@ def update_responder(rid):
         "ocsp_uri": (data.get("ocsp_uri", row["ocsp_uri"]) or "").strip(),
         "frequency_min": int(data.get("frequency_min", row["frequency_min"])),
         "enabled": 1 if data.get("enabled", bool(row["enabled"])) else 0,
-        # The detail view returns the real push URL, so the form field is
-        # authoritative: save exactly what it holds (empty clears it). Only an
-        # omitted key leaves the stored value untouched.
+        # The form field is authoritative: save exactly what it holds, after
+        # canonicalization (empty clears it). Only an omitted key leaves the
+        # stored value untouched.
         "uptime_kuma_url": (
-            (data.get("uptime_kuma_url") or "").strip()
+            normalize_kuma_url(data.get("uptime_kuma_url"))
             if "uptime_kuma_url" in data else row["uptime_kuma_url"]
         ),
         # Only touch the test selection if the client sent it.
@@ -1641,26 +1695,41 @@ def responder_history(rid):
     db = get_db()
     limit = min(int(request.args.get("limit", 50)), HISTORY_LIMIT)
     rows = db.execute(
-        "SELECT id, status, message, timestamp, comment FROM history "
+        "SELECT id, status, message, timestamp, comment, excluded FROM history "
         "WHERE responder_id=? ORDER BY timestamp DESC LIMIT ?",
         (rid, limit),
     ).fetchall()
     return jsonify([dict(r) for r in rows])
 
 
-# ---- Downtime comments ---- #
+# ---- Downtime comments & exclusion ---- #
 @app.route("/api/history/<int:hid>", methods=["PUT"])
 def update_history_comment(hid):
-    """Attach (or clear) an operator comment on a status-change row."""
+    """Update an operator comment and/or the exclude flag on a status-change row.
+
+    Each field is touched only when its key is present, so a caller can toggle
+    exclusion without clearing the comment (or vice versa). `excluded` persists
+    the operator's choice to drop this event from uptime reports.
+    """
     data = request.get_json(silent=True) or {}
-    comment = (data.get("comment") or "").strip()
+    sets, params = [], []
+    if "comment" in data:
+        sets.append("comment=?")
+        params.append((data.get("comment") or "").strip() or None)
+    if "excluded" in data:
+        sets.append("excluded=?")
+        params.append(1 if data.get("excluded") else 0)
+    if not sets:
+        return jsonify({"message": "Nothing to update (send 'comment' and/or 'excluded')."}), 400
     db = get_db()
-    cur = db.execute("UPDATE history SET comment=? WHERE id=?", (comment or None, hid))
+    params.append(hid)
+    cur = db.execute(f"UPDATE history SET {', '.join(sets)} WHERE id=?", params)
     db.commit()
     if cur.rowcount == 0:
         return jsonify({"message": "Not found"}), 404
     row = db.execute(
-        "SELECT id, status, message, timestamp, comment FROM history WHERE id=?", (hid,)
+        "SELECT id, status, message, timestamp, comment, excluded FROM history WHERE id=?",
+        (hid,),
     ).fetchone()
     return jsonify(dict(row))
 

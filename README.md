@@ -216,11 +216,15 @@ Open **Reports** in the toolbar. Pick a time frame (quick ranges or custom
 from/to) and, optionally, specific monitors (none selected = all). Three views:
 
 - **Uptime** — per-monitor uptime %, with a breakdown of up / down / maintenance
-  / disabled / no-data time, and the list of downtimes in range. Each downtime
-  shows the **reason** (the error/status that caused it) and an editable
-  **comment** that's stored on the status-change event for future reports.
+  / disabled / excluded / no-data time, and the list of downtimes in range. Each
+  downtime shows the **reason** (the error/status that caused it) and an editable
+  **comment** that's stored on the status-change event for future reports. Each
+  downtime also has an **Exclude** / **Re-include** toggle that drops (or
+  restores) that single event from the uptime calculation — the choice is
+  persisted on the event, so it survives closing and reopening Reports, and the
+  uptime % updates immediately.
 - **All downtimes** — a single chronological list of every downtime across the
-  selected monitors for the period.
+  selected monitors for the period (with the same comment + exclude controls).
 - **Maintenance windows** — define windows (per monitor or for all monitors)
   whose time is **excluded** from uptime calculations.
 
@@ -313,7 +317,7 @@ All endpoints are under `<prefix>/api`:
 | POST | `/api/responders/{id}/disable` | Disable the monitor (audited). |
 | GET | `/api/responders/{id}/history?limit=N` | Status-change history (with `id` + `comment`). |
 | GET | `/api/responders/{id}/audit` | Enable/disable/create audit log. |
-| PUT | `/api/history/{id}` | Set/clear the comment on a status-change row. |
+| PUT | `/api/history/{id}` | Set/clear the `comment` and/or the report `excluded` flag on a status-change row. |
 | GET/POST | `/api/maintenance` | List / create maintenance windows. |
 | DELETE | `/api/maintenance/{id}` | Delete a maintenance window. |
 | GET | `/api/reports/uptime` | Per-monitor uptime + downtimes for a window. |
@@ -335,8 +339,11 @@ single-responder detail); a boolean `uptime_kuma_url_set` indicates whether one
 is configured. The real value is returned only by `POST
 /api/responders/<id>/kuma-url` (used by the edit/clone form, and subject to the
 `X-Requested-With` CSRF guard like other mutations). On update, an included
-`uptime_kuma_url` is saved verbatim (blank clears it); omit the key to keep the
-stored value.
+`uptime_kuma_url` is saved (blank clears it); omit the key to keep the stored
+value. The push URL is **normalized** on save: repeated slashes in the path are
+collapsed (Uptime Kuma sometimes emits `//api/push/...`, which can 404) and any
+`status` / `msg` / `ping` query params are dropped (the app sets those itself),
+while other query params are preserved — so it works however it was pasted.
 
 State-changing requests (`POST`/`PUT`/`DELETE`) must include an
 `X-Requested-With` header and a JSON body, and are rate-limited per client IP.

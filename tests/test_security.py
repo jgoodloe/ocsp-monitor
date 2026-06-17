@@ -185,7 +185,7 @@ def test_mutation_requires_csrf_header(m):
 
 
 # --------------------------------------------------------------------------- #
-# Push URL: real value in the detail view (verifiable/clonable), masked in list
+# Push URL: never in clear in a GET body; revealed only via a CSRF-guarded POST
 # --------------------------------------------------------------------------- #
 def _csrf():
     return {"X-Requested-With": "XMLHttpRequest"}
@@ -200,16 +200,42 @@ def _make_responder(client, **extra):
     return r.get_json()["id"]
 
 
-def test_push_url_visible_in_detail_masked_in_list(m):
+def test_push_url_masked_in_detail_and_list(m):
+    """The token never appears in clear in any GET body (detail or list)."""
     client = m.app.test_client()
     url = "https://status.example.com/api/push/SECRETTOKEN"
     rid = _make_responder(client, uptime_kuma_url=url)
 
     detail = client.get(f"/api/responders/{rid}").get_json()
-    assert detail["uptime_kuma_url"] == url  # verbatim, for verify/clone
+    assert "SECRETTOKEN" not in detail["uptime_kuma_url"]   # masked in detail
+    assert detail["uptime_kuma_url_set"] is True
 
     listed = next(x for x in client.get("/api/responders").get_json() if x["id"] == rid)
-    assert "SECRETTOKEN" not in listed["uptime_kuma_url"]  # masked in bulk list
+    assert "SECRETTOKEN" not in listed["uptime_kuma_url"]   # masked in bulk list
+
+
+def test_reveal_endpoint_returns_token_and_requires_csrf(m):
+    """The real token is reachable only via the POST reveal endpoint, which the
+    CSRF guard protects — a cross-origin page can't set X-Requested-With."""
+    client = m.app.test_client()
+    url = "https://status.example.com/api/push/SECRETTOKEN"
+    rid = _make_responder(client, uptime_kuma_url=url)
+
+    # Without the CSRF header the reveal is rejected (no token leak).
+    blocked = client.post(f"/api/responders/{rid}/kuma-url")
+    assert blocked.status_code == 403
+    assert "SECRETTOKEN" not in blocked.get_data(as_text=True)
+
+    # With the header, the operator gets the verbatim URL for verify/clone.
+    revealed = client.post(f"/api/responders/{rid}/kuma-url", headers=_csrf())
+    assert revealed.status_code == 200
+    assert revealed.get_json()["uptime_kuma_url"] == url
+
+
+def test_reveal_unknown_responder_is_404(m):
+    client = m.app.test_client()
+    r = client.post("/api/responders/999999/kuma-url", headers=_csrf())
+    assert r.status_code == 404
 
 
 def test_update_push_url_is_authoritative(m):
@@ -217,10 +243,14 @@ def test_update_push_url_is_authoritative(m):
     url = "https://status.example.com/api/push/TOK1"
     rid = _make_responder(client, uptime_kuma_url=url)
 
+    def stored():
+        return client.post(f"/api/responders/{rid}/kuma-url",
+                           headers=_csrf()).get_json()["uptime_kuma_url"]
+
     # Omitting the key keeps the stored value.
     client.put(f"/api/responders/{rid}", json={"frequency_min": 30}, headers=_csrf())
-    assert client.get(f"/api/responders/{rid}").get_json()["uptime_kuma_url"] == url
+    assert stored() == url
 
     # An explicit empty value clears it (what you see is what's saved).
     client.put(f"/api/responders/{rid}", json={"uptime_kuma_url": ""}, headers=_csrf())
-    assert client.get(f"/api/responders/{rid}").get_json()["uptime_kuma_url"] == ""
+    assert stored() == ""

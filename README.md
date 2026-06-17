@@ -108,12 +108,14 @@ blast radius but does not replace access control.
   a JSON content type, which browsers can't send cross-origin without a CORS
   preflight the app never grants. Set `SameSite` on any session cookie you add.
 - **Secrets.** The Uptime Kuma push URL embeds a token. It is stored in SQLite
-  and never logged. The bulk list endpoint returns it **masked**, but the
-  single-responder detail view (used by the edit/clone form) returns it in full
-  so the operator can verify it — anyone who can reach that endpoint sees the
-  token, so keep the app behind your reverse proxy. Treat the data volume as
-  secret-bearing and protect it. On edit, the push-URL field is authoritative:
-  it is saved exactly as shown (blank clears it).
+  and never logged, and **never returned in clear by any GET** — both the list
+  and the single-responder detail view return it **masked**. The edit/clone form
+  retrieves the real value on demand from a dedicated `POST
+  /api/responders/<id>/kuma-url` endpoint, which (being a mutation-style POST) is
+  covered by the `X-Requested-With` CSRF guard, so a cross-origin page can't
+  trigger it and the token stays out of cacheable/loggable GET bodies. Treat the
+  data volume as secret-bearing and protect it. On edit, the push-URL field is
+  authoritative: it is saved exactly as shown (blank clears it).
 - **Error messages.** Network/parse errors are returned to clients as generic,
   category-level messages (full detail is logged server-side) so they can't be
   used as an SSRF reconnaissance oracle.
@@ -302,7 +304,8 @@ All endpoints are under `<prefix>/api`:
 | GET | `/api/status` | Health check (used by Docker HEALTHCHECK). |
 | GET | `/api/responders` | List responders (no PEM payload). |
 | POST | `/api/responders` | Create a responder. |
-| GET | `/api/responders/{id}` | Get one responder (includes PEM). |
+| GET | `/api/responders/{id}` | Get one responder (PEM included; push URL masked). |
+| POST | `/api/responders/{id}/kuma-url` | Reveal the real Uptime Kuma push URL (CSRF-guarded). |
 | PUT | `/api/responders/{id}` | Update a responder. |
 | DELETE | `/api/responders/{id}` | Delete a responder. |
 | POST | `/api/responders/{id}/check` | Run a check now. |
@@ -327,11 +330,13 @@ default set", and an array of test keys (e.g. `["cert_status","signature"]`)
 pins that responder's own selection. A `response_time_ms` field (or `null` to
 inherit the global default) sets the limit for the response-time test. The most
 recent per-test outcomes are returned in `last_checks`. The `uptime_kuma_url`
-field is returned in full by the single-responder `GET /api/responders/<id>`
-(so it can be verified or cloned) and **masked** in the `GET /api/responders`
-list; a boolean `uptime_kuma_url_set` indicates whether one is configured. On
-update, an included `uptime_kuma_url` is saved verbatim (blank clears it); omit
-the key to keep the stored value.
+field is **masked** in every GET response (both the list and the
+single-responder detail); a boolean `uptime_kuma_url_set` indicates whether one
+is configured. The real value is returned only by `POST
+/api/responders/<id>/kuma-url` (used by the edit/clone form, and subject to the
+`X-Requested-With` CSRF guard like other mutations). On update, an included
+`uptime_kuma_url` is saved verbatim (blank clears it); omit the key to keep the
+stored value.
 
 State-changing requests (`POST`/`PUT`/`DELETE`) must include an
 `X-Requested-With` header and a JSON body, and are rate-limited per client IP.

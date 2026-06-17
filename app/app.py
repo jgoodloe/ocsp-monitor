@@ -1349,12 +1349,12 @@ def responder_to_dict(row, include_pem=True):
         "ocsp_uri": row["ocsp_uri"],
         "frequency_min": row["frequency_min"],
         "enabled": bool(row["enabled"]),
-        # The push URL embeds a secret token. The single-responder detail view
-        # (include_pem=True), used by the edit/clone form, returns it verbatim
-        # so the operator can verify and clone it; the bulk list stays masked to
-        # avoid spraying every token across one response.
-        "uptime_kuma_url": (row["uptime_kuma_url"] if include_pem
-                            else _mask_secret_url(row["uptime_kuma_url"])),
+        # The push URL embeds a secret token, so it is ALWAYS masked here — no
+        # GET response ever carries it in clear. The edit/clone form retrieves
+        # the real value on demand via the CSRF-guarded POST reveal endpoint
+        # (see reveal_kuma_url), keeping the token out of cacheable/loggable GET
+        # bodies and reachable only by an explicit, same-origin action.
+        "uptime_kuma_url": _mask_secret_url(row["uptime_kuma_url"]),
         "uptime_kuma_url_set": bool((row["uptime_kuma_url"] or "").strip()),
         # None means "inherit the global default set".
         "tests": parse_tests(row["tests"] if "tests" in row.keys() else None),
@@ -1415,6 +1415,26 @@ def get_responder(rid):
     if not row:
         return jsonify({"message": "Not found"}), 404
     return jsonify(responder_to_dict(row, include_pem=True))
+
+
+@app.route("/api/responders/<int:rid>/kuma-url", methods=["POST"])
+def reveal_kuma_url(rid):
+    """Return the Uptime Kuma push URL (secret token) in clear.
+
+    Deliberately a POST so the global `_guard_requests` hook applies: it requires
+    the `X-Requested-With` header, which a cross-origin page cannot set without a
+    CORS preflight the app never grants. This keeps the token out of every GET
+    body (so it can't leak via caches, proxy logs, or a future CORS misconfig)
+    and makes revealing it an explicit, same-origin-only action. Used by the
+    edit/clone form to populate the field for verification.
+    """
+    db = get_db()
+    row = db.execute(
+        "SELECT uptime_kuma_url FROM responders WHERE id=?", (rid,)
+    ).fetchone()
+    if not row:
+        return jsonify({"message": "Not found"}), 404
+    return jsonify({"uptime_kuma_url": row["uptime_kuma_url"] or ""})
 
 
 def _tests_to_db(value):

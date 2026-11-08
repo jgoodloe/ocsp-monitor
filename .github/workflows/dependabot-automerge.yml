@@ -2,14 +2,16 @@ name: Dependabot auto-merge
 
 # Approves and enables auto-merge for Dependabot PRs that are patch- or
 # minor-level (including patch/minor security updates). The merge itself only
-# happens once the required status checks (the `tests` workflow) pass, so a bump
-# that breaks the suite will NOT be merged. MAJOR version bumps are deliberately
-# left untouched here and wait for a human to review and merge.
+# happens once the required CI gate (the ci.yml `test`, `security` and `build`
+# jobs) passes, so a bump that breaks tests OR is still vulnerable OR breaks the
+# image build will NOT be merged. MAJOR version bumps are deliberately left
+# untouched here and wait for a human to review and merge.
 #
 # Requires, in repo settings (one-time):
 #   * Settings -> General -> "Allow auto-merge" enabled.
-#   * A branch protection rule on `main` requiring the "pytest" status check
-#     (this is both the merge gate and what makes --auto hold the PR).
+#   * A branch protection rule on `main` requiring the `test`, `security` and
+#     `build` status checks (from ci.yml) — both the merge gate and what makes
+#     --auto hold the PR until CI is green.
 
 on: pull_request
 

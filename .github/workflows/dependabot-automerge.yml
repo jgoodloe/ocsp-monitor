@@ -1,0 +1,39 @@
+name: Dependabot auto-merge
+
+# Approves and enables auto-merge for Dependabot PRs that are patch- or
+# minor-level (including patch/minor security updates). The merge itself only
+# happens once the required status checks (the `tests` workflow) pass, so a bump
+# that breaks the suite will NOT be merged. MAJOR version bumps are deliberately
+# left untouched here and wait for a human to review and merge.
+#
+# Requires, in repo settings (one-time):
+#   * Settings -> General -> "Allow auto-merge" enabled.
+#   * A branch protection rule on `main` requiring the "pytest" status check
+#     (this is both the merge gate and what makes --auto hold the PR).
+
+on: pull_request
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  dependabot:
+    runs-on: ubuntu-latest
+    # Only act on PRs opened by Dependabot itself.
+    if: ${{ github.event.pull_request.user.login == 'dependabot[bot]' }}
+    steps:
+      - name: Fetch Dependabot metadata
+        id: meta
+        uses: dependabot/fetch-metadata@v2
+
+      - name: Approve and enable auto-merge (patch/minor only)
+        if: >-
+          ${{ steps.meta.outputs.update-type == 'version-update:semver-patch' ||
+              steps.meta.outputs.update-type == 'version-update:semver-minor' }}
+        run: |
+          gh pr review --approve "$PR_URL"
+          gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

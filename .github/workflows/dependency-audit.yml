@@ -1,0 +1,32 @@
+name: Dependency audit
+
+# Surfaces known CVEs in the pinned dependencies via pip-audit, on every PR and
+# on a weekly schedule (so freshly-disclosed advisories show up even with no
+# code change). Non-blocking for now (`|| true`) so it does not freeze unrelated
+# merges on the existing advisory backlog. Once requirements.txt is clean, drop
+# the `|| true` to turn this into a hard gate that fails CI on any new advisory.
+on:
+  pull_request:
+  schedule:
+    - cron: "41 7 * * 1" # Mondays, off-the-hour to dodge runner congestion
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pip-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run pip-audit (advisory, non-blocking)
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          pip-audit -r requirements.txt -r requirements-dev.txt || true

@@ -3,6 +3,12 @@ name: Build and publish Docker image
 on:
   push:
     branches: [main]
+  # Weekly rebuild so the image re-pulls the latest patched python:3.12-slim
+  # base layers and reinstalls the current wheels, picking up base-OS security
+  # fixes that land within the same tag (which Dependabot does not detect).
+  schedule:
+    - cron: "23 7 * * 1" # Mondays, off-the-hour
+  workflow_dispatch:
 
 jobs:
   build-and-push:

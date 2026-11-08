@@ -2,9 +2,17 @@ services:
   ocsp-monitor:
     build: .
     # Or use a prebuilt image instead of build:
-    # image: ghcr.io/youruser/ocsp-monitor:latest
+    # image: ghcr.io/jgoodloe/ocsp-monitor:latest
+    #
+    # NOTE: the watchtower service below can only auto-update a container that
+    # runs from a registry image, not one built locally with `build:`. For
+    # hands-off updates, comment out `build: .` and use the `image:` line above.
     container_name: ocsp-monitor
     restart: unless-stopped
+    labels:
+      # Opt this container in to watchtower auto-updates (watchtower is started
+      # with label-scoping, so only labelled containers are touched).
+      com.centurylinklabs.watchtower.enable: "true"
     ports:
       # Bind to loopback only: the app has no authentication, so expose it
       # through your reverse proxy rather than directly. Point the proxy
@@ -39,6 +47,30 @@ services:
     volumes:
       # Persistent SQLite database (survives container rebuilds).
       - ocsp_data:/data
+
+  # --- Optional: automatic image updates on the host --------------------------
+  # Closes the last mile that GitHub can't: polls the registry and, when a new
+  # :latest is published (by the docker-publish workflow), pulls it and restarts
+  # ocsp-monitor with the patched image — no manual redeploy.
+  #
+  # Opt-in: it lives behind the "autoupdate" profile, so a plain `docker compose
+  # up -d` does NOT start it. Enable with:
+  #     docker compose --profile autoupdate up -d
+  #
+  # Requirements / caveats:
+  #   * ocsp-monitor must run from the registry `image:` (not `build:`) — see above.
+  #   * Mounting the Docker socket grants watchtower root-equivalent control of
+  #     the host's Docker; only enable it if you accept that trade-off.
+  #   * If ghcr.io/jgoodloe/ocsp-monitor is PRIVATE, also mount registry creds,
+  #     e.g. add under volumes: - ~/.docker/config.json:/config.json:ro
+  watchtower:
+    image: containrrr/watchtower:1.7.1
+    container_name: ocsp-watchtower
+    restart: unless-stopped
+    profiles: ["autoupdate"]
+    command: --label-enable --cleanup --rolling-restart --interval 21600  # every 6h
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
 
 volumes:
   ocsp_data:

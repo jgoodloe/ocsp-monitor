@@ -849,6 +849,23 @@ def run_ocsp_check(cert_pem, issuer_pem, ocsp_uri, enabled_tests=None,
         record("response_status", False,
                f"OCSP response status: {ocsp_resp.response_status.name}.")
         return finish(response_ms=elapsed_ms)
+    # A SUCCESSFUL BasicOCSPResponse must carry exactly one SingleResponse. A
+    # response with zero or several is still valid DER (so it parsed above) and
+    # still reports SUCCESSFUL, but the single-response accessors used below
+    # (this_update_utc, certificate_status, serial_number, ...) raise ValueError
+    # for any count != 1. Reject it here so a hostile or broken responder can't
+    # freeze the stored status — the ValueError would otherwise escape before
+    # the DB update and leave the last status in place — or 500 a manual check.
+    try:
+        single_count = sum(1 for _ in ocsp_resp.response_iter)
+    except Exception:
+        single_count = -1  # fail closed: treat an unreadable response as malformed
+    if single_count != 1:
+        detail = "unparseable" if single_count < 0 else str(single_count)
+        record("response_status", False,
+               "OCSP response is malformed: expected exactly one SingleResponse, "
+               f"got {detail}.")
+        return finish(response_ms=elapsed_ms)
     record("response_status", True, "OCSP responseStatus is successful.")
 
     def _fmt(dt):

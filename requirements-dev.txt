@@ -1,2 +1,5 @@
 # Development/test dependencies (installed on top of requirements.txt).
 pytest==9.0.3
+# Used only by tests to craft malformed-but-valid OCSP responses (cryptography's
+# own builder only emits well-formed single-response messages).
+asn1crypto==1.5.1

@@ -11,6 +11,11 @@ the `cryptography` library to build and verify real OCSP requests (no shelling
 out to the openssl binary).
 """
 
+# Single source of truth for the release version. The release-cut workflow bumps
+# this; release.yml verifies the git tag matches it before publishing. Keep the
+# exact `__version__ = "X.Y.Z"` form — tooling parses it by regex.
+__version__ = "0.1.0"
+
 import os
 import json
 import base64
@@ -1465,7 +1470,7 @@ def index():
 def api_status():
     try:
         get_db().execute("SELECT 1")
-        return jsonify({"status": "ok", "database": "connected"})
+        return jsonify({"status": "ok", "database": "connected", "version": __version__})
     except Exception as e:
         log.error("[Health] database check failed: %s", e)
         return jsonify({"status": "error", "database": "unavailable"}), 500

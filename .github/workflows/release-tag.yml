@@ -1,0 +1,58 @@
+name: Release tag
+
+# When a "Prepare release vX.Y.Z" commit lands on main (from release-cut's merged
+# PR), create the matching git tag. The tag push triggers release.yml, which runs
+# the full gate and publishes the release.
+#
+# CRITICAL: the tag is created with RELEASE_TOKEN (a PAT), NOT GITHUB_TOKEN. A ref
+# created with GITHUB_TOKEN does not trigger other workflows, so release.yml would
+# never run and nothing would build. Without RELEASE_TOKEN this still creates the
+# tag (so history is correct) but warns loudly that no build will be triggered.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    if: ${{ startsWith(github.event.head_commit.message, 'Prepare release v') }}
+    steps:
+      - name: Create the release tag (with RELEASE_TOKEN so it triggers the build)
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          MSG: ${{ github.event.head_commit.message }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Parse "vX.Y.Z" from the head commit subject.
+          TAG=$(printf '%s\n' "$MSG" | head -1 \
+            | sed -nE 's/^Prepare release (v[0-9]+\.[0-9]+\.[0-9]+).*/\1/p')
+          if [ -z "$TAG" ]; then
+            echo "::error::Could not parse a vX.Y.Z version from head commit subject: $MSG"
+            exit 1
+          fi
+          echo "Release tag: $TAG"
+
+          if [ -z "${RELEASE_TOKEN:-}" ]; then
+            echo "::warning::RELEASE_TOKEN is not set — creating $TAG with GITHUB_TOKEN. A tag created by GITHUB_TOKEN does NOT trigger release.yml, so the release build will NOT start. Set RELEASE_TOKEN (a fine-grained PAT) and re-run, or push the tag manually, to trigger the build."
+          fi
+
+          # Idempotent: skip if the tag already exists.
+          if gh api "repos/$REPO/git/ref/tags/$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists; nothing to do."
+            exit 0
+          fi
+
+          # Create the tag ref via the API using the chosen token. Creating it
+          # with the PAT is what lets the tag push trigger release.yml.
+          gh api --method POST "repos/$REPO/git/refs" \
+            -f ref="refs/tags/$TAG" \
+            -f sha="$SHA"
+          echo "Created $TAG at $SHA — release.yml will build and publish it."

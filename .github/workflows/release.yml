@@ -7,10 +7,12 @@ name: Release
 #   * push a semver tag:   git tag v1.2.3 && git push origin v1.2.3
 #   * or run it on demand: Actions -> Release -> Run workflow (enter the version)
 #
-# The `publish` job targets the `production` GitHub Environment, which must have
-# a REQUIRED REVIEWER (you). GitHub then pauses here and sends you an approval
-# request (email + web notification) — the release is cut only after you approve.
-# That is the "alert me and let me decide it should become a release" step.
+# The `publish` job runs through the `production` GitHub Environment. If you add
+# a REQUIRED REVIEWER to it (Settings -> Environments -> production), GitHub
+# pauses here and emails/notifies you for approval before the release is cut —
+# the "alert me and let me decide it should become a release" gate. Leave it with
+# no reviewer for a fully hands-off (zero-click) release. Either way, the full
+# gate above must pass before anything is published.
 on:
   push:
     tags: ["v*.*.*"]
@@ -55,6 +57,19 @@ jobs:
             *) echo "::error::Version must look like v1.2.3 (got '$VERSION')"; exit 1 ;;
           esac
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Verify the version constant matches the tag
+        # Guards against a mislabeled release: the tag being published must match
+        # __version__ in app/app.py. release-cut keeps these in sync; a hand-cut
+        # tag that disagrees fails here instead of shipping the wrong version.
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          FILE_VER=$(python3 -c "import re; print(re.search(r'^__version__ = \"(\d+\.\d+\.\d+)\"', open('app/app.py').read(), re.M).group(1))")
+          if [ "v$FILE_VER" != "$VERSION" ]; then
+            echo "::error::app/app.py __version__ is v$FILE_VER but the release tag is $VERSION — refusing to publish a mislabeled release."
+            exit 1
+          fi
+          echo "Version guard OK: $VERSION"
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io

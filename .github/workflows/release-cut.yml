@@ -1,0 +1,104 @@
+name: Release cut
+
+# Manually start a release. This bumps the version constant, rolls the CHANGELOG
+# (Unreleased -> dated section), pushes a release-prep/vX.Y.Z branch, opens a PR,
+# and enables auto-merge. When that PR merges to main with the commit subject
+# "Prepare release vX.Y.Z", release-tag.yml creates the tag and the release
+# pipeline builds and publishes it.
+#
+# Uses RELEASE_TOKEN (a fine-grained PAT) for the branch push, the PR, and
+# auto-merge so the PR is authored by YOU — not github-actions[bot]. A bot PR has
+# its CI held for manual "Approve and run", never reports required checks, and
+# its merge does not trigger downstream workflows, which breaks the zero-click
+# flow. Without RELEASE_TOKEN it falls back to GITHUB_TOKEN with a warning.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Semver bump for this release"
+        required: true
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  cut:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Select token (prefer RELEASE_TOKEN)
+        id: tok
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          if [ -n "$RELEASE_TOKEN" ]; then
+            echo "using=release" >> "$GITHUB_OUTPUT"
+            echo "Using RELEASE_TOKEN (PR will be authored by you)."
+          else
+            echo "using=github" >> "$GITHUB_OUTPUT"
+            echo "::warning::RELEASE_TOKEN is not set — falling back to GITHUB_TOKEN. The prep PR will be authored by github-actions[bot]: its CI is held for manual 'Approve and run', required checks never report, and auto-merge will NOT trigger the tag/release workflows. Add a fine-grained PAT named RELEASE_TOKEN (Contents: read/write AND Pull requests: read/write) for the zero-click flow."
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # Persist the chosen token so `git push` below is authenticated as the
+          # PAT owner (so the branch/commit/PR are attributed to you).
+          token: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Bump version and roll the changelog
+        id: prep
+        run: |
+          NEW=$(python3 scripts/release_prep.py "${{ inputs.bump }}")
+          echo "version=$NEW" >> "$GITHUB_OUTPUT"
+          echo "Prepared release v$NEW (${{ inputs.bump }} bump)."
+
+      - name: Commit, push branch, open PR, enable auto-merge
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          USING: ${{ steps.tok.outputs.using }}
+          VERSION: ${{ steps.prep.outputs.version }}
+        run: |
+          set -euo pipefail
+          BRANCH="release-prep/v${VERSION}"
+
+          # Attribute the commit to the acting token's user when possible (so it
+          # is you, not the bot). Falls back to the github-actions[bot] identity.
+          # NB: UID is a read-only bash var, so use a different name.
+          LOGIN=$(gh api user --jq .login 2>/dev/null || echo "github-actions[bot]")
+          ACTOR_ID=$(gh api user --jq .id 2>/dev/null || echo "41898282")
+          git config user.name "$LOGIN"
+          git config user.email "${ACTOR_ID}+${LOGIN}@users.noreply.github.com"
+
+          git switch -c "$BRANCH"
+          git add app/app.py CHANGELOG.md
+          git commit -m "Prepare release v${VERSION}"
+          git push -u origin "$BRANCH"
+
+          # Build the body without leading indentation (4+ leading spaces would
+          # render as a markdown code block in the PR).
+          BODY=$(printf '%s\n' \
+            "Automated release prep for **v${VERSION}**: bumps \`__version__\` in \`app/app.py\` and rolls \`CHANGELOG.md\`." \
+            "" \
+            "On merge (squash subject \`Prepare release v${VERSION}\`), release-tag.yml creates tag \`v${VERSION}\`, which triggers the build/release pipeline (release.yml).")
+          PR_URL=$(gh pr create --base main --head "$BRANCH" \
+            --title "Prepare release v${VERSION}" --body "$BODY")
+          echo "Opened $PR_URL"
+
+          if [ "$USING" = "release" ]; then
+            # --subject makes the squash commit start with the tag-trigger phrase
+            # regardless of the repo's default squash message setting.
+            if gh pr merge --auto --squash \
+                 --subject "Prepare release v${VERSION}" "$PR_URL"; then
+              echo "Auto-merge enabled; the PR merges once required checks pass."
+            else
+              echo "::warning::Could not enable auto-merge. Check that 'Allow auto-merge' is on (Settings -> General) and that branch protection on main requires status checks. The prep PR is open — merge it to continue the release."
+            fi
+          else
+            echo "::warning::Not enabling auto-merge under GITHUB_TOKEN (its merge would not trigger the downstream tag build). Merge the PR manually, or set RELEASE_TOKEN for the zero-click flow."
+          fi

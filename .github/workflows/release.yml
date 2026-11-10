@@ -1,0 +1,96 @@
+name: Release
+
+# A build only becomes a release after it passes the FULL gate (tests +
+# security/CVE scan + working image build) AND a human approves it.
+#
+# Trigger it either way:
+#   * push a semver tag:   git tag v1.2.3 && git push origin v1.2.3
+#   * or run it on demand: Actions -> Release -> Run workflow (enter the version)
+#
+# The `publish` job runs through the `production` GitHub Environment. If you add
+# a REQUIRED REVIEWER to it (Settings -> Environments -> production), GitHub
+# pauses here and emails/notifies you for approval before the release is cut —
+# the "alert me and let me decide it should become a release" gate. Leave it with
+# no reviewer for a fully hands-off (zero-click) release. Either way, the full
+# gate above must pass before anything is published.
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, e.g. v1.2.3"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Re-run the exact same gate a PR runs. If anything fails, there is no release.
+  gate:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+      packages: write
+
+  publish:
+    needs: gate
+    runs-on: ubuntu-latest
+    # Approval gate: requires the `production` environment's required reviewer to
+    # approve before this job runs. Create it under Settings -> Environments.
+    environment: production
+    permissions:
+      contents: write # create the GitHub Release
+      packages: write # push the release image
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve version
+        id: v
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME}"
+          fi
+          case "$VERSION" in
+            v[0-9]*) : ;;
+            *) echo "::error::Version must look like v1.2.3 (got '$VERSION')"; exit 1 ;;
+          esac
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Verify the version constant matches the tag
+        # Guards against a mislabeled release: the tag being published must match
+        # __version__ in app/app.py. release-cut keeps these in sync; a hand-cut
+        # tag that disagrees fails here instead of shipping the wrong version.
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          FILE_VER=$(python3 -c "import re; print(re.search(r'^__version__ = \"(\d+\.\d+\.\d+)\"', open('app/app.py').read(), re.M).group(1))")
+          if [ "v$FILE_VER" != "$VERSION" ]; then
+            echo "::error::app/app.py __version__ is v$FILE_VER but the release tag is $VERSION — refusing to publish a mislabeled release."
+            exit 1
+          fi
+          echo "Version guard OK: $VERSION"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - name: Build & push release image (:<version> and :latest)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/jgoodloe/ocsp-monitor:${{ steps.v.outputs.version }}
+            ghcr.io/jgoodloe/ocsp-monitor:latest
+      - name: Create / publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          gh release create "$VERSION" \
+            --repo "${{ github.repository }}" \
+            --title "$VERSION" \
+            --generate-notes \
+          || gh release edit "$VERSION" --repo "${{ github.repository }}" --draft=false

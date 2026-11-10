@@ -11,6 +11,11 @@ the `cryptography` library to build and verify real OCSP requests (no shelling
 out to the openssl binary).
 """
 
+# Single source of truth for the release version. The release-cut workflow bumps
+# this; release.yml verifies the git tag matches it before publishing. Keep the
+# exact `__version__ = "X.Y.Z"` form — tooling parses it by regex.
+__version__ = "0.1.0"
+
 import os
 import json
 import base64
@@ -849,6 +854,23 @@ def run_ocsp_check(cert_pem, issuer_pem, ocsp_uri, enabled_tests=None,
         record("response_status", False,
                f"OCSP response status: {ocsp_resp.response_status.name}.")
         return finish(response_ms=elapsed_ms)
+    # A SUCCESSFUL BasicOCSPResponse must carry exactly one SingleResponse. A
+    # response with zero or several is still valid DER (so it parsed above) and
+    # still reports SUCCESSFUL, but the single-response accessors used below
+    # (this_update_utc, certificate_status, serial_number, ...) raise ValueError
+    # for any count != 1. Reject it here so a hostile or broken responder can't
+    # freeze the stored status — the ValueError would otherwise escape before
+    # the DB update and leave the last status in place — or 500 a manual check.
+    try:
+        single_count = sum(1 for _ in ocsp_resp.response_iter)
+    except Exception:
+        single_count = -1  # fail closed: treat an unreadable response as malformed
+    if single_count != 1:
+        detail = "unparseable" if single_count < 0 else str(single_count)
+        record("response_status", False,
+               "OCSP response is malformed: expected exactly one SingleResponse, "
+               f"got {detail}.")
+        return finish(response_ms=elapsed_ms)
     record("response_status", True, "OCSP responseStatus is successful.")
 
     def _fmt(dt):
@@ -1448,7 +1470,7 @@ def index():
 def api_status():
     try:
         get_db().execute("SELECT 1")
-        return jsonify({"status": "ok", "database": "connected"})
+        return jsonify({"status": "ok", "database": "connected", "version": __version__})
     except Exception as e:
         log.error("[Health] database check failed: %s", e)
         return jsonify({"status": "error", "database": "unavailable"}), 500

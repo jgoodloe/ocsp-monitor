@@ -35,15 +35,16 @@ jobs:
           fi
           cat audit.txt
 
-      - name: Trivy scan of the published :latest image
-        uses: aquasecurity/trivy-action@0.28.0
-        continue-on-error: true # report in logs; the issue alert is driven by pip-audit
-        with:
-          scan-type: image
-          image-ref: ghcr.io/jgoodloe/ocsp-monitor:latest
-          severity: HIGH,CRITICAL
-          ignore-unfixed: true
-          format: table
+      - name: Trivy scan of the published :latest image (base OS, advisory)
+        # Run Trivy from its official image (reliable reference). Advisory only —
+        # the issue alert is driven by pip-audit above; this surfaces base-OS
+        # CVEs in the logs. Pin aquasec/trivy to a version/digest for full
+        # reproducibility.
+        continue-on-error: true
+        run: |
+          docker run --rm aquasec/trivy:latest image \
+            --severity HIGH,CRITICAL --ignore-unfixed \
+            ghcr.io/jgoodloe/ocsp-monitor:latest || true
 
       - name: Open or update the alert issue
         if: ${{ steps.pipaudit.outputs.vulnerable == 'true' }}

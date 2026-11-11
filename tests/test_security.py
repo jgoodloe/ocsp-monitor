@@ -352,3 +352,75 @@ def test_malformed_single_response_count_yields_error(monkeypatch, m, n):
     rs = next(c for c in res.checks if c["key"] == "response_status")
     assert rs["status"] == "fail"
     assert "SingleResponse" in rs["message"]
+
+
+def _signed_good_response():
+    """Issuer/leaf plus a GOOD single-response OCSP response signed by the
+    issuer — the case that must resolve to Valid."""
+    from datetime import datetime, timezone, timedelta
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+    from cryptography.x509 import ocsp
+
+    now = datetime.now(timezone.utc)
+    ikey = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    iname = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Regr CA")])
+    issuer = (x509.CertificateBuilder().subject_name(iname).issuer_name(iname)
+              .public_key(ikey.public_key()).serial_number(1)
+              .not_valid_before(now - timedelta(days=1))
+              .not_valid_after(now + timedelta(days=365))
+              .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+              .sign(ikey, hashes.SHA256()))
+    lkey = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    leaf = (x509.CertificateBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "leaf")]))
+            .issuer_name(iname).public_key(lkey.public_key()).serial_number(42)
+            .not_valid_before(now - timedelta(days=1))
+            .not_valid_after(now + timedelta(days=200))
+            .sign(ikey, hashes.SHA256()))
+    der = (ocsp.OCSPResponseBuilder()
+           .add_response(cert=leaf, issuer=issuer, algorithm=hashes.SHA1(),
+                         cert_status=ocsp.OCSPCertStatus.GOOD,
+                         this_update=now - timedelta(minutes=5),
+                         next_update=now + timedelta(hours=12),
+                         revocation_time=None, revocation_reason=None)
+           .responder_id(ocsp.OCSPResponderEncoding.NAME, issuer)
+           .sign(ikey, hashes.SHA256())
+           .public_bytes(serialization.Encoding.DER))
+    pem = serialization.Encoding.PEM
+    return leaf.public_bytes(pem).decode(), issuer.public_bytes(pem).decode(), der
+
+
+def test_good_single_response_is_valid(monkeypatch, m):
+    """A well-formed GOOD OCSP response must resolve to Valid. Regression for the
+    `response_iter` bug: a wrong/absent attribute failed EVERY response (good or
+    bad), which the malformed-only tests missed because both land on Error."""
+    cert_pem, issuer_pem, der = _signed_good_response()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/ocsp-response")
+            self.end_headers()
+            self.wfile.write(der)
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), Handler)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    monkeypatch.setattr(m, "OCSP_ALLOWED_HOSTS", ["127.0.0.1"])
+    try:
+        res = m.run_ocsp_check(
+            cert_pem, issuer_pem, f"http://127.0.0.1:{port}/ocsp",
+            m.FOUNDATIONAL_KEYS + ["cert_status", "cert_id_match", "signature",
+                                   "this_update", "next_update"])
+    finally:
+        srv.shutdown()
+
+    assert res.status == "Valid", f"{res.status}: {res.message}"
+    assert all(c["status"] == "pass" for c in res.checks), res.message

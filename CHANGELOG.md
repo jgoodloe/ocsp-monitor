@@ -6,6 +6,14 @@ entries under **Unreleased** into a dated version section.
 
 ## Unreleased
 
+## v1.1.1 - 2026-11-11
+
+- Fix OCSP checks reporting "malformed ... got unparseable" on healthy
+  responders: the exactly-one-SingleResponse probe referenced `response_iter`,
+  an attribute current `cryptography` does not expose, so EVERY response (even
+  GOOD) errored. Now probes a stable single-response accessor and catches the
+  version-agnostic ValueError; adds a good-response regression test.
+
 ## v1.1.0 - 2026-11-11
 
 - Gated CI/CD release pipeline with CVE scanning and release approval gate.

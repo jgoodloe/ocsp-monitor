@@ -6,10 +6,11 @@ entries under **Unreleased** into a dated version section.
 
 ## Unreleased
 
-## v0.1.1 - 2026-11-10
+## v1.1.0 - 2026-11-11
 
 - Gated CI/CD release pipeline with CVE scanning and release approval gate.
 - Dependency CVE remediation automation (Dependabot + CI auto-merge).
-- Dependency backlog cleared (cryptography 50, requests 2.33, Flask 3.1).
+- Dependencies cleared of known CVEs and updated: cryptography 50.0.2, requests 2.34.2, Flask 3.1.3, gunicorn 26.2.0.
 - Fix uncaught `ValueError` on malformed `SUCCESSFUL` OCSP responses.
 - Automated release-cut / release-tag workflows.
+- Pinned and updated CI actions (checkout, setup-python, build-push, setup-buildx, fetch-metadata).

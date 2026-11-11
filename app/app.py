@@ -14,7 +14,7 @@ out to the openssl binary).
 # Single source of truth for the release version. The release-cut workflow bumps
 # this; release.yml verifies the git tag matches it before publishing. Keep the
 # exact `__version__ = "X.Y.Z"` form — tooling parses it by regex.
-__version__ = "0.1.1"
+__version__ = "1.1.0"
 
 import os
 import json

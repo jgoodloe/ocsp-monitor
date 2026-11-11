@@ -14,7 +14,7 @@ out to the openssl binary).
 # Single source of truth for the release version. The release-cut workflow bumps
 # this; release.yml verifies the git tag matches it before publishing. Keep the
 # exact `__version__ = "X.Y.Z"` form — tooling parses it by regex.
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 import os
 import json
@@ -854,22 +854,19 @@ def run_ocsp_check(cert_pem, issuer_pem, ocsp_uri, enabled_tests=None,
         record("response_status", False,
                f"OCSP response status: {ocsp_resp.response_status.name}.")
         return finish(response_ms=elapsed_ms)
-    # A SUCCESSFUL BasicOCSPResponse must carry exactly one SingleResponse. A
-    # response with zero or several is still valid DER (so it parsed above) and
-    # still reports SUCCESSFUL, but the single-response accessors used below
-    # (this_update_utc, certificate_status, serial_number, ...) raise ValueError
-    # for any count != 1. Reject it here so a hostile or broken responder can't
-    # freeze the stored status — the ValueError would otherwise escape before
-    # the DB update and leave the last status in place — or 500 a manual check.
+    # A SUCCESSFUL BasicOCSPResponse must carry exactly one SingleResponse. The
+    # single-response accessors used below (certificate_status, this_update,
+    # serial_number, ...) raise ValueError for 0 or >1 responses, so probe one
+    # here and reject a malformed response cleanly — otherwise that ValueError
+    # escapes and freezes the stored status (scheduler) or 500s a manual check.
+    # Probe a stable accessor rather than iterating: the iterate-all attribute's
+    # name differs across cryptography versions (responses vs response_iter) and
+    # may be absent, which would wrongly fail every (even valid) response.
     try:
-        single_count = sum(1 for _ in ocsp_resp.response_iter)
-    except Exception:
-        single_count = -1  # fail closed: treat an unreadable response as malformed
-    if single_count != 1:
-        detail = "unparseable" if single_count < 0 else str(single_count)
+        ocsp_resp.certificate_status
+    except ValueError:
         record("response_status", False,
-               "OCSP response is malformed: expected exactly one SingleResponse, "
-               f"got {detail}.")
+               "OCSP response is malformed (expected exactly one SingleResponse).")
         return finish(response_ms=elapsed_ms)
     record("response_status", True, "OCSP responseStatus is successful.")
 

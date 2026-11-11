@@ -1,0 +1,59 @@
+# Dependabot keeps dependencies patched automatically.
+#
+# How the pieces fit together:
+#   * This file opens PRs when deps are outdated (scheduled) and, once
+#     "Dependabot security updates" is enabled in repo settings, immediately
+#     when a CVE is disclosed for a pinned version.
+#   * .github/workflows/dependabot-automerge.yml auto-approves + auto-merges
+#     the patch/minor (and patch/minor security) PRs once CI is green. MAJOR
+#     bumps are left for a human to review (they most often carry breaking
+#     changes the test suite may not catch).
+#   * Merging to main triggers docker-publish.yml, which rebuilds & pushes the
+#     image so the fixed `cryptography` wheel (and its bundled OpenSSL) ships.
+version: 2
+updates:
+  # --- Python runtime + dev dependencies (requirements.txt, requirements-dev.txt) ---
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "deps"
+    groups:
+      # Collapse patch/minor bumps into one PR so they auto-merge together.
+      # Major bumps are intentionally excluded here and get individual PRs.
+      python-patch-minor:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # --- Docker base image (FROM python:3.12-slim) ---
+  # Note: Dependabot only reacts to tag changes (e.g. 3.12-slim -> 3.13-slim),
+  # NOT to patched rebuilds of the SAME tag. Base-OS CVEs within 3.12-slim are
+  # handled by the weekly scheduled rebuild in docker-publish.yml instead.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "docker"
+
+  # --- GitHub Actions pinned in workflows ---
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions-patch-minor:
+        update-types:
+          - "minor"
+          - "patch"

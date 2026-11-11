@@ -1,0 +1,75 @@
+name: Security scan
+
+# Daily CVE watch on the CURRENTLY pinned dependencies and the published release
+# image. Dependabot (security updates) is what opens the fix PRs the moment a
+# patched version is available; this job is the safety net + the alert: if the
+# pinned set or the live image is vulnerable with a fix available, it opens (or
+# updates) a tracking issue so you know you need to merge the bump and cut a
+# release. It does not release anything itself.
+on:
+  schedule:
+    - cron: "17 6 * * *" # daily, off-the-hour
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write # open/update the alert issue
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: pip-audit (pinned dependencies)
+        id: pipaudit
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          if pip-audit -r requirements.txt -r requirements-dev.txt > audit.txt 2>&1; then
+            echo "vulnerable=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "vulnerable=true" >> "$GITHUB_OUTPUT"
+          fi
+          cat audit.txt
+
+      - name: Trivy scan of the published :latest image (base OS, advisory)
+        # Run Trivy from its official image (reliable reference). Advisory only —
+        # the issue alert is driven by pip-audit above; this surfaces base-OS
+        # CVEs in the logs. Pin aquasec/trivy to a version/digest for full
+        # reproducibility.
+        continue-on-error: true
+        run: |
+          docker run --rm aquasec/trivy:latest image \
+            --severity HIGH,CRITICAL --ignore-unfixed \
+            ghcr.io/jgoodloe/ocsp-monitor:latest || true
+
+      - name: Open or update the alert issue
+        if: ${{ steps.pipaudit.outputs.vulnerable == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TITLE="[security] Known-vulnerable dependencies detected (fix available)"
+          {
+            echo "The daily security scan found pinned dependencies with known advisories that have a fix available."
+            echo ""
+            echo "Action: review the Dependabot PR(s), merge the bump, and cut a release (Actions -> Release)."
+            echo ""
+            echo "Scan run: $RUN_URL"
+            echo ""
+            echo '```'
+            cat audit.txt
+            echo '```'
+          } > body.md
+          NUM=$(gh issue list --repo "$REPO" --state open --label security \
+                  --search "in:title Known-vulnerable dependencies detected" \
+                  --json number --jq '.[0].number // empty')
+          if [ -n "$NUM" ]; then
+            gh issue comment "$NUM" --repo "$REPO" --body-file body.md
+          else
+            gh issue create --repo "$REPO" --title "$TITLE" --label security,dependencies --body-file body.md
+          fi

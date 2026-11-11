@@ -254,3 +254,101 @@ def test_update_push_url_is_authoritative(m):
     # An explicit empty value clears it (what you see is what's saved).
     client.put(f"/api/responders/{rid}", json={"uptime_kuma_url": ""}, headers=_csrf())
     assert stored() == ""
+
+
+# --------------------------------------------------------------------------- #
+# Malformed SUCCESSFUL OCSP response (!=1 SingleResponse): must not raise or
+# freeze the status. A valid-DER response that reports SUCCESSFUL but carries 0
+# or >1 SingleResponse makes cryptography's single-response accessors raise
+# ValueError; before the fix that escaped run_ocsp_check (status silently frozen
+# in the scheduler / HTTP 500 on manual check). It must now resolve to "Error".
+# --------------------------------------------------------------------------- #
+def _gen_cert_and_issuer():
+    from datetime import datetime, timezone, timedelta
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    now = datetime.now(timezone.utc)
+    ikey = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    iname = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Regr Issuer")])
+    issuer = (x509.CertificateBuilder().subject_name(iname).issuer_name(iname)
+              .public_key(ikey.public_key()).serial_number(1)
+              .not_valid_before(now - timedelta(days=1))
+              .not_valid_after(now + timedelta(days=365))
+              .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+              .sign(ikey, hashes.SHA256()))
+    lkey = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    leaf = (x509.CertificateBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "leaf")]))
+            .issuer_name(iname).public_key(lkey.public_key()).serial_number(42)
+            .not_valid_before(now - timedelta(days=1))
+            .not_valid_after(now + timedelta(days=200))
+            .sign(ikey, hashes.SHA256()))
+    pem = serialization.Encoding.PEM
+    return leaf.public_bytes(pem).decode(), issuer.public_bytes(pem).decode()
+
+
+def _malformed_ocsp_der(n):
+    """A valid-DER, SUCCESSFUL BasicOCSPResponse carrying exactly n SingleResponses."""
+    from datetime import datetime, timezone
+    from asn1crypto import ocsp, algos, core
+
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+
+    def sr(serial):
+        return ocsp.SingleResponse({
+            "cert_id": ocsp.CertId({
+                "hash_algorithm": algos.DigestAlgorithm({"algorithm": "sha1"}),
+                "issuer_name_hash": b"\x00" * 20, "issuer_key_hash": b"\x00" * 20,
+                "serial_number": serial}),
+            "cert_status": ocsp.CertStatus({"good": core.Null()}),
+            "this_update": now, "next_update": now})
+
+    basic = ocsp.BasicOCSPResponse({
+        "tbs_response_data": ocsp.ResponseData({
+            "responder_id": ocsp.ResponderId({"by_key": b"\x00" * 20}),
+            "produced_at": now,
+            "responses": ocsp.Responses([sr(i + 1) for i in range(n)])}),
+        "signature_algorithm": algos.SignedDigestAlgorithm({"algorithm": "sha256_rsa"}),
+        "signature": core.OctetBitString(b"\x00" * 64)})
+    return ocsp.OCSPResponse({
+        "response_status": "successful",
+        "response_bytes": ocsp.ResponseBytes({
+            "response_type": "basic_ocsp_response", "response": basic})}).dump()
+
+
+@pytest.mark.parametrize("n", [0, 2])
+def test_malformed_single_response_count_yields_error(monkeypatch, m, n):
+    der = _malformed_ocsp_der(n)
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/ocsp-response")
+            self.end_headers()
+            self.wfile.write(der)
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), Handler)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    monkeypatch.setattr(m, "OCSP_ALLOWED_HOSTS", ["127.0.0.1"])
+    cert_pem, issuer_pem = _gen_cert_and_issuer()
+    try:
+        # Must not raise (the bug let a ValueError escape here), and must report
+        # Error rather than leaving the previous status in place.
+        res = m.run_ocsp_check(
+            cert_pem, issuer_pem, f"http://127.0.0.1:{port}/ocsp",
+            m.FOUNDATIONAL_KEYS + ["cert_status", "signature"])
+    finally:
+        srv.shutdown()
+
+    assert res.status == "Error", res.status
+    rs = next(c for c in res.checks if c["key"] == "response_status")
+    assert rs["status"] == "fail"
+    assert "SingleResponse" in rs["message"]

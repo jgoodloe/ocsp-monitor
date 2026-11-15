@@ -6,6 +6,15 @@ entries under **Unreleased** into a dated version section.
 
 ## Unreleased
 
+- Add authentication: OIDC SSO (authlib, matched on the stable `sub` claim) and
+  a local argon2id username/password fallback with a break-glass admin. Signed
+  `HttpOnly`/`SameSite=Lax` session cookie; OIDC state + nonce validation;
+  reverse-proxy/subpath-aware callback URL. **Breaking:** the app is now
+  fail-closed and refuses to start with no auth configured unless
+  `OCSPMON_ALLOW_OPEN_MODE=true` is set. Config via `OCSPMON_*` env vars; see
+  `docs/AUTH.md`. Pins `authlib>=1.8.0` (excludes CVE-2024-37568),
+  `passlib[argon2]`, and `itsdangerous>=2.2.0`.
+
 ## v1.1.1 - 2026-11-11
 
 - Fix OCSP checks reporting "malformed ... got unparseable" on healthy

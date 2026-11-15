@@ -15,6 +15,8 @@ def m(tmp_path_factory):
     os.environ["DATA_DIR"] = str(d)
     os.environ["DB_PATH"] = str(d / "feat.db")
     os.environ["TRUSTED_PROXY_HOPS"] = "0"
+    # Feature tests hit the API directly; run the app in explicit open mode.
+    os.environ["OCSPMON_ALLOW_OPEN_MODE"] = "true"
     spec = importlib.util.spec_from_file_location("ocsp_feat_under_test", APP_PATH)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)

@@ -25,6 +25,9 @@ def m(tmp_path_factory):
     os.environ["DATA_DIR"] = str(d)
     os.environ["DB_PATH"] = str(d / "test.db")
     os.environ["TRUSTED_PROXY_HOPS"] = "0"
+    # These tests exercise the (unauthenticated) API surface directly, so run the
+    # app in explicit open mode rather than configuring auth.
+    os.environ["OCSPMON_ALLOW_OPEN_MODE"] = "true"
     spec = importlib.util.spec_from_file_location("ocsp_app_under_test", APP_PATH)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)

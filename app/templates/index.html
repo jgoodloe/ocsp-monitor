@@ -125,9 +125,11 @@
   <h1><span class="dot"></span> OCSP Monitor</h1>
   <div class="toolbar">
     <span class="msg muted" id="globalMsg"></span>
+    <span class="msg muted" id="authUser" style="display:none"></span>
     <button class="secondary" onclick="openReports()">Reports</button>
     <button class="secondary" onclick="openSettings()">Settings</button>
     <button onclick="openForm()">+ Add responder</button>
+    <button class="secondary" id="signOutBtn" style="display:none" onclick="signOut()">Sign out</button>
   </div>
 </header>
 
@@ -771,7 +773,29 @@ async function delMaint(id) {
 document.querySelectorAll('.overlay').forEach(o =>
   o.addEventListener('click', e => { if (e.target === o) o.classList.remove('open'); }));
 
+// Show who's signed in (and a Sign out button) when authentication is enabled.
+async function signOut() {
+  try { await mutate(API('/auth/logout'), 'POST'); } catch (e) { /* ignore */ }
+  const base = window.location.pathname.replace(/\/+$/, "");
+  window.location.href = base + "/login";
+}
+async function initAuth() {
+  try {
+    const cfg = await (await fetch(API('/auth/config'))).json();
+    if (!cfg.auth_required) return;  // open mode: nothing to show
+    const me = await fetch(API('/auth/me'));
+    if (me.ok) {
+      const u = await me.json();
+      const el = document.getElementById('authUser');
+      el.textContent = u.display_name || u.subject || '';
+      el.style.display = '';
+      document.getElementById('signOutBtn').style.display = '';
+    }
+  } catch (e) { /* non-fatal */ }
+}
+
 async function init() {
+  initAuth();
   await loadTests();
   // Preload the global default so the Add form shows it before Settings is opened.
   try { globalDefaultTests = (await (await fetch(API('/settings'))).json()).default_tests || []; }

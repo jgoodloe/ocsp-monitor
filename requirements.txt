@@ -2,3 +2,13 @@ Flask==3.1.3
 gunicorn==26.2.0
 requests==2.34.2
 cryptography==50.0.2
+
+# --- Authentication (OIDC SSO + local login) ---
+# authlib provides the OpenID Connect client. The floor is set ABOVE the fix for
+# CVE-2024-37568 (JWS "alg" confusion / OIDC ID-token forgery); the whole
+# range excludes every affected version.
+authlib>=1.8.0,<2.0.0
+# argon2id password hashing for the local/break-glass admin fallback.
+passlib[argon2]>=1.7.4,<2.0.0
+# Signs the session cookie (Flask dependency; pinned to the current fixed line).
+itsdangerous>=2.2.0,<3.0.0

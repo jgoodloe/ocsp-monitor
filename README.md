@@ -50,9 +50,22 @@ the global default) and set a per-responder response-time threshold:
 ```bash
 git clone <this-repo> ocsp-monitor
 cd ocsp-monitor
-cp .env.example .env        # optional; defaults are sensible
+cp .env.example .env        # then configure authentication — see below
 docker compose up -d --build
 ```
+
+> **Authentication is required to start.** The app is fail-closed: it refuses to
+> boot unless you configure sign-in (or explicitly opt into open mode). The
+> quickest path is a local admin — set these in `.env`:
+>
+> ```ini
+> OCSPMON_SESSION_SECRET=<openssl rand -hex 32>
+> OCSPMON_BOOTSTRAP_ADMIN_PASSWORD=<a strong password>
+> ```
+>
+> then sign in as `admin`. To wire up OIDC SSO (authentik), or to run with no
+> auth on an isolated box (`OCSPMON_ALLOW_OPEN_MODE=true`), see
+> **[docs/AUTH.md](docs/AUTH.md)**.
 
 Open <http://localhost:8080>. Click **+ Add responder** and provide:
 
@@ -88,11 +101,28 @@ several certs from the same CA).
 | `RATE_LIMIT_MUTATE` | `60` | Per-IP create/update/delete/settings requests per minute (0 = off). |
 | `RATE_LIMIT_CHECK` | `20` | Per-IP on-demand check requests per minute (0 = off). |
 
+Authentication adds its own `OCSPMON_*` variables (session secret, local admin,
+OIDC/SSO). They are documented in **[docs/AUTH.md](docs/AUTH.md)** and
+`.env.example`.
+
+## Authentication
+
+The app has **built-in authentication**: OIDC SSO (designed for authentik) and a
+local username/password fallback (argon2id). It is **fail-closed** — it refuses
+to start unless auth is configured, or you explicitly opt into open mode with
+`OCSPMON_ALLOW_OPEN_MODE=true`. There are no roles: any authenticated user has
+full access (you can optionally restrict SSO sign-in to specific IdP groups).
+
+See **[docs/AUTH.md](docs/AUTH.md)** for the full guide — the authentik setup
+checklist, the exact redirect URI, every `OCSPMON_*` variable, and first-admin
+bootstrap. The `OCSPMON_*` variables are also listed in `.env.example` and wired
+through `docker-compose.yml`.
+
 ## Security
 
-This app has **no built-in authentication** — run it behind a reverse proxy
-that handles auth, and on a trusted network. The hardening below reduces the
-blast radius but does not replace access control.
+Authentication (above) is the primary access control. The hardening below
+reduces the blast radius of the authenticated surface and of the server-side
+fetches the app makes.
 
 - **SSRF egress controls.** The OCSP URI, the URL from a certificate's AIA
   extension, and the Uptime Kuma push URL are all validated before any
@@ -106,7 +136,8 @@ blast radius but does not replace access control.
   for sensitive networks.
 - **CSRF.** State-changing API requests require an `X-Requested-With` header and
   a JSON content type, which browsers can't send cross-origin without a CORS
-  preflight the app never grants. Set `SameSite` on any session cookie you add.
+  preflight the app never grants. The session cookie is `HttpOnly`,
+  `SameSite=Lax`, and `Secure` by default.
 - **Secrets.** The Uptime Kuma push URL embeds a token. It is stored in SQLite
   and never logged, and **never returned in clear by any GET** — both the list
   and the single-responder detail view return it **masked**. The edit/clone form

@@ -14,11 +14,15 @@ services:
       # with label-scoping, so only labelled containers are touched).
       com.centurylinklabs.watchtower.enable: "true"
     ports:
-      # Bind to loopback only: the app has no authentication, so expose it
-      # through your reverse proxy rather than directly. Point the proxy
-      # upstream at 127.0.0.1:8080. To serve it directly (no proxy), change
-      # this to "8080:8080" AND set TRUSTED_PROXY_HOPS=0 so forwarded headers
-      # can't be spoofed.
+      # Bind to loopback only and expose through your reverse proxy (which also
+      # terminates TLS). Point the proxy upstream at 127.0.0.1:8080. To serve it
+      # directly (no proxy), change this to "8080:8080" AND set
+      # TRUSTED_PROXY_HOPS=0 so forwarded headers can't be spoofed.
+      #
+      # The app now has built-in authentication (OIDC SSO + local login) and is
+      # fail-closed: it refuses to start unless auth is configured or you set
+      # OCSPMON_ALLOW_OPEN_MODE=true. Configure it via the OCSPMON_* vars below
+      # (see .env.example and docs/AUTH.md).
       - "127.0.0.1:8080:8080"
     environment:
       PORT: "8080"
@@ -44,6 +48,28 @@ services:
       MAX_RESPONDERS: "${MAX_RESPONDERS:-100}"
       RATE_LIMIT_MUTATE: "${RATE_LIMIT_MUTATE:-60}"
       RATE_LIMIT_CHECK: "${RATE_LIMIT_CHECK:-20}"
+      # --- Authentication (OIDC SSO + local login) --------------------------
+      # Fail-closed: with none of these set the app refuses to start. For an
+      # isolated single-user/dev box only, opt out with OCSPMON_ALLOW_OPEN_MODE.
+      # Full guide: docs/AUTH.md. Values come from your .env (see .env.example).
+      OCSPMON_ALLOW_OPEN_MODE: "${OCSPMON_ALLOW_OPEN_MODE:-}"
+      # Session cookie: generate a stable secret with `openssl rand -hex 32`.
+      OCSPMON_SESSION_SECRET: "${OCSPMON_SESSION_SECRET:-}"
+      OCSPMON_SESSION_TTL_SECONDS: "${OCSPMON_SESSION_TTL_SECONDS:-28800}"
+      OCSPMON_SESSION_COOKIE_SECURE: "${OCSPMON_SESSION_COOKIE_SECURE:-true}"
+      # Break-glass local admin (create/reset at startup when a password is set).
+      OCSPMON_BOOTSTRAP_ADMIN_USERNAME: "${OCSPMON_BOOTSTRAP_ADMIN_USERNAME:-admin}"
+      OCSPMON_BOOTSTRAP_ADMIN_PASSWORD: "${OCSPMON_BOOTSTRAP_ADMIN_PASSWORD:-}"
+      OCSPMON_LOCAL_LOGIN_ENABLED: "${OCSPMON_LOCAL_LOGIN_ENABLED:-true}"
+      # OIDC / SSO (authentik). All three required to enable the SSO button.
+      OCSPMON_OIDC_ISSUER: "${OCSPMON_OIDC_ISSUER:-}"
+      OCSPMON_OIDC_CLIENT_ID: "${OCSPMON_OIDC_CLIENT_ID:-}"
+      OCSPMON_OIDC_CLIENT_SECRET: "${OCSPMON_OIDC_CLIENT_SECRET:-}"
+      OCSPMON_OIDC_SCOPES: "${OCSPMON_OIDC_SCOPES:-openid email profile}"
+      OCSPMON_OIDC_GROUP_CLAIM: "${OCSPMON_OIDC_GROUP_CLAIM:-groups}"
+      OCSPMON_OIDC_ALLOWED_GROUPS: "${OCSPMON_OIDC_ALLOWED_GROUPS:-}"
+      # Public origin for building the OIDC redirect URI (no trailing slash).
+      OCSPMON_PUBLIC_BASE_URL: "${OCSPMON_PUBLIC_BASE_URL:-}"
     volumes:
       # Persistent SQLite database (survives container rebuilds).
       - ocsp_data:/data

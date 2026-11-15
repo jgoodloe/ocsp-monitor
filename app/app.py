@@ -17,6 +17,7 @@ out to the openssl binary).
 __version__ = "1.1.1"
 
 import os
+import sys
 import json
 import base64
 import socket
@@ -37,6 +38,12 @@ from flask import (
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.middleware.dispatcher import DispatcherMiddleware
 from werkzeug.wrappers import Response
+
+# Make sibling modules (auth.py) importable whether the app is launched with the
+# app/ directory as CWD (gunicorn --chdir app app:app) or loaded by file path
+# (the test suite uses importlib on app.py).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import auth  # noqa: E402  (local module; relies on the sys.path shim above)
 
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature
@@ -1289,7 +1296,15 @@ def compute_uptime(db, rid, win_start, win_end, down_mode="not_valid",
 # --------------------------------------------------------------------------- #
 # Flask app
 # --------------------------------------------------------------------------- #
-app = Flask(__name__)
+# Pin the template/static folders to this file's location so templates resolve
+# regardless of the working directory or how the module is imported (gunicorn
+# --chdir, or importlib-by-path in the test suite).
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+app = Flask(
+    __name__,
+    template_folder=os.path.join(_APP_DIR, "templates"),
+    static_folder=os.path.join(_APP_DIR, "static"),
+)
 # Trust X-Forwarded-* only for the configured number of proxy hops. Setting
 # TRUSTED_PROXY_HOPS=0 disables ProxyFix, which is the correct choice when the
 # app is exposed directly (otherwise clients can spoof X-Forwarded-* to forge
@@ -1908,6 +1923,11 @@ def put_settings():
 
 # Initialise DB + scheduler at import time (works under gunicorn too).
 init_db()
+# Install authentication (OIDC SSO + local login). This also enforces the
+# fail-closed policy: if no auth is configured and OCSPMON_ALLOW_OPEN_MODE is not
+# set, init_app raises and the process refuses to start — so the scheduler below
+# never runs on an unauthenticated, network-reachable deployment.
+auth.init_app(app, get_db=get_db, raw_db=raw_db, now_iso=now_iso)
 start_scheduler()
 
 # Apply URL prefix for subpath deployments.
